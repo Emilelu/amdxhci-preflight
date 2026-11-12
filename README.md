@@ -238,7 +238,17 @@ cd ../gux && ./build_gux.sh <源码树> <输出目录>   # 不用 xcodebuild 编
 
 拷到 `EFI/OC/Kexts/AMDXHCIPreflight.kext`，`MinKernel` 填 `19.0.0`（Catalina 起），`MaxKernel` 留空。
 
-> **兼容范围：Catalina 10.15 → Tahoe 26，同一个 x86_64 二进制。** 这个 bug 是 AMD 平台特有的（Intel 机型不出现），且与 macOS 版本无关 —— Catalina 上装不装原版 fork 都卡，所以没有理由把它限制在 Sonoma 之上。代码只用 `IOService` / `IOPCIDevice` / `IOMemoryMap` / `IOLog` / `IOSleep` 和自己定义的一套 xHCI 寄存器常量，不继承任何 USB 类，因此不随 USB 栈改版错位。版本门槛全在 plist 里：`com.apple.kpi.*` 声明 `12.0.0`（10.9 起就没变过），`com.apple.iokit.IOPCIFamily` 声明 **`2.6`** 而不是编译机上的 `2.9` —— 加载器要求「库的 compatible 版 ≤ 声明值 ≤ 库的 CFBundleVersion」，取低界才能一个二进制通吃（Catalina 的 `IOPCIFamily` 是 2.8 一代，同样满足）。Mojave 及更早没验过，真要用就把 `MinKernel` 改成 `18.0.0` / `17.0.0`。
+> **设计覆盖 Catalina 10.15 → Tahoe 26，但真机实测只做到 26.7.3 的「能加载」这一步。** 具体分三档，别把推断当结论：
+>
+> | 结论 | 证据强度 |
+> |---|---|
+> | 二进制本身不带版本门槛：`otool -l` 里**没有** `LC_BUILD_VERSION` / `LC_VERSION_MIN_MACOSX`，`vtool -show-build` 输出为空，所以不存在「打包时写死 minos 26」这种坑 | 已实测（26.7.3 上逐条枚举 load command） |
+> | 依赖声明在 Catalina..Tahoe 上都满足：`com.apple.kpi.*` 要求 `12.0.0`（10.9 起未变），`IOPCIFamily` 要求 `2.6` ≤ 各版本的 2.8/2.9 | 加载器的版本规则是明确的，但只在 26.7.3 上真跑过依赖解析 |
+> | 代码只调用 `IOService` / `IOPCIDevice` / `IOMemoryMap` / `IOLog` / `IOSleep` / `PE_parse_boot_argn`，都是 10.9 时代就有的 KPI | 读头文件得出，未在旧内核上验证符号解析 |
+> | 「能加载」之后的运行时链路（构造器执行 → personality 匹配 → preflight 写寄存器 → 让位给 Apple 驱动） | **完全未验证**：26.7.3 上被 UAKEL 策略拦在 `not approved to load`，从没真正进过内核 |
+> | 真机能不能不卡开机 | **完全未验证**：我手上没有 AMD 机器 |
+>
+> 换句话说：`MinKernel 19.0.0` 是「按依赖和二进制检查推出来的下限」，不是「在 Catalina 上跑通了的结论」。
 
 > 必须走 OpenCore 注入（进 kernelcache、开机早期加载）。放进 `/Library/Extensions` 是**开机后**才加载的，对开机卡住没有帮助。
 

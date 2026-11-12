@@ -33,17 +33,17 @@ EFI/OC/Kexts/AMDXHCIPreflight.kext
 </dict>
 ```
 
-`MinKernel 19.0.0` = **Catalina 10.15 起**（19.x）。这个 bug 是 AMD 平台特有的、与 macOS 版本无关（Catalina 上装不装原版 fork 都卡），所以兼容范围直接从 Catalina 划起。kext 只依赖 `com.apple.kpi.*` 和 `com.apple.iokit.IOPCIFamily`，plist 里声明的是 `IOPCIFamily 2.6`（不是编译机上的 2.9），同一个二进制从 Catalina 一直能加载到 Tahoe：
+`MinKernel 19.0.0` = **Catalina 10.15 起**（19.x）。这个 bug 是 AMD 平台特有的、与 macOS 版本无关（Catalina 上装不装原版 fork 都卡），所以兼容下限从 Catalina 划起。kext 只依赖 `com.apple.kpi.*` 和 `com.apple.iokit.IOPCIFamily`，plist 里声明的是 `IOPCIFamily 2.6`（不是编译机上的 2.9）；二进制里**没有** `LC_BUILD_VERSION` / `LC_VERSION_MIN_MACOSX`，所以不带任何「打包时写死的最低系统」：
 
-| 系统 | `MinKernel` |
-|---|---|
-| Catalina 10.15 | `19.0.0` |
-| Big Sur 11 | `20.0.0` |
-| Monterey 12 | `21.0.0` |
-| Ventura 13 | `22.0.0` |
-| Sonoma 14 | `23.0.0` |
-| Sequoia 15 | `24.0.0` |
-| Tahoe 26 | `25.0.0` |
+| 系统 | `MinKernel` | 状态 |
+|---|---|---|
+| Catalina 10.15 | `19.0.0` | 依赖与二进制检查通过，**未在真机跑过** |
+| Big Sur 11 | `20.0.0` | 同上，未在真机跑过 |
+| Monterey 12 / Ventura 13 | `21.0.0` / `22.0.0` | 同上，未在真机跑过 |
+| Sonoma 14 / Sequoia 15 | `23.0.0` / `24.0.0` | 同上，未在真机跑过 |
+| Tahoe 26 | `25.0.0` | 在这一代上完成编译、依赖解析、符号绑定；实际加载被 UAKEL 拦下，未进过内核 |
+
+说清楚这条边界：以上是**按加载器版本规则和二进制检查推出来的可用范围**，不是逐版本实测结论。真正跑通要靠你在 AMD 机上试，验证命令见第 4 节。
 
 Mojave 10.14 / High Sierra 10.13 没验过（要试就把 `MinKernel` 改成 `18.0.0` / `17.0.0`）。`MaxKernel` 留空表示不设上限。
 
