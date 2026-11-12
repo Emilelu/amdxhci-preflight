@@ -1,0 +1,1122 @@
+diff --git a/GenericUSBXHCI/AMDXHCIPreflight.h b/GenericUSBXHCI/AMDXHCIPreflight.h
+new file mode 100644
+index 0000000..35a7a89
+--- /dev/null
++++ b/GenericUSBXHCI/AMDXHCIPreflight.h
+@@ -0,0 +1,840 @@
++//
++//  AMDXHCIPreflight.h
++//  Deterministic xHCI hand-off for AMD platforms (hackintosh).
++//
++//  Header-only, IOKit-free, allocation-free, no libc. Includes into exactly one
++//  translation unit (a kext source file). Every register access goes through the
++//  amdxhci::Io callback table, so the exact same code can be unit tested on the
++//  host against a simulated controller (see test_amdxhci.cpp).
++//
++//  What it does, in order:
++//    1. sanity: is there a real controller behind BAR0 (or a phantom device)?
++//    2. drain CNR so the later reset cannot be issued while the HC is busy
++//    3. xHCI legacy support: mask the BIOS SMI enables, take OS ownership
++//    4. halt the controller (clear RS/INTE/EWE/HSEE)
++//    5. host controller reset, bounded, with retries
++//    6. zero CRCR / DCBAAP / CONFIG (no firmware DMA state left)
++//    7. write-1-to-clear USBSTS and every port change bit, unstick link states
++//    8. disable MSI and MSI-X enable bits at the PCI level
++//
++//  Everything above is bounded in time, idempotent and safe to run on a
++//  controller that is already in a clean state.
++//
++
++#ifndef AMDXHCI_PREFLIGHT_H
++#define AMDXHCI_PREFLIGHT_H
++
++#include <stdint.h>
++
++namespace amdxhci
++{
++
++/* ------------------------------------------------------------------------- */
++/* Register map (xHCI 1.0 / 1.1, offsets into BAR0)                          */
++/* ------------------------------------------------------------------------- */
++enum
++{
++	kRegCapBase	= 0x00,
++	kRegHciVersion	= 0x02,
++	kRegHcsParams1	= 0x04,
++	kRegHccParams	= 0x10,
++
++	kOpUsbCmd	= 0x00,
++	kOpUsbSts	= 0x04,
++	kOpCrcrLo	= 0x18,
++	kOpCrcrHi	= 0x1C,
++	kOpDcbaapLo	= 0x30,
++	kOpDcbaapHi	= 0x34,
++	kOpConfig	= 0x38,
++	kOpPortBase	= 0x400,
++	kOpPortStride	= 0x10,
++
++	kCapLengthMin	= 0x20,
++	kCapLengthMax	= 0xFC,
++	kHciVersionMin	= 0x0090,
++	kHciVersionMax	= 0x0140,
++	kMaxPorts	= 127,
++	kMaxSlots	= 255,
++
++	kPciCommand	= 0x04,
++	kPciStatus	= 0x06,
++	kPciCapPtr	= 0x34,
++	kPciCapMsi	= 0x05,
++	kPciCapMsix	= 0x11,
++	kPciCapPm	= 0x01
++};
++
++/* USBCMD / USBSTS bits */
++enum
++{
++	kCmdRunStop	= 0x00000001u,
++	kCmdReset	= 0x00000002u,
++	kCmdIntEn	= 0x00000004u,
++	kCmdHsErrEn	= 0x00000008u,
++	kCmdWrapEvent	= 0x00000400u,
++	kStsHalted	= 0x00000001u,
++	kStsHsErr	= 0x00000004u,
++	kStsEventInt	= 0x00000008u,
++	kStsPortChange	= 0x00000010u,
++	kStsSaveRestErr	= 0x00000400u,
++	kStsNotReady	= 0x00000800u,
++	kStsHcError	= 0x00001000u
++};
++
++/* PortSC bits */
++enum
++{
++	kPortConnStat	= 0x00000001u,
++	kPortEnabled	= 0x00000002u,
++	kPortOverCurr	= 0x00000008u,
++	kPortReset	= 0x00000010u,
++	kPortPower	= 0x00000200u,
++	kPortLinkWrStrobe = 0x00010000u,
++	kPortConnChange	= 0x00020000u,
++	kPortEnChange	= 0x00040000u,
++	kPortWarmRstChg	= 0x00080000u,
++	kPortOverCurrChg = 0x00100000u,
++	kPortResetChg	= 0x00200000u,
++	kPortLinkStChg	= 0x00400000u,
++	kPortCfgErrChg	= 0x00800000u,
++	kPortWakeEn	= 0x02000000u,
++	kPortDisconnWakeEn = 0x04000000u,
++	kPortOverCurrWakeEn = 0x08000000u,
++	kPortWarmReset	= 0x80000000u,
++
++	kPortChangeBits	= 0x00FE0000u,
++	kPortWriteBack	= (kPortPower | 0x0000C000u | kPortWakeEn | kPortDisconnWakeEn |
++			   kPortOverCurrWakeEn)
++};
++
++/* Port link states (PLS) */
++enum
++{
++	kLinkU0		= 0,
++	kLinkU3		= 3,
++	kLinkDisabled	= 4,
++	kLinkRxDetect	= 5,
++	kLinkInactive	= 6,
++	kLinkPolling	= 7,
++	kLinkRecovery	= 8,
++	kLinkHotReset	= 9,
++	kLinkCompliance	= 10,
++	kLinkLoopback	= 11,
++	kLinkResume	= 15
++};
++
++/* Legacy support capability */
++enum
++{
++	kExtCapLegacySup	= 1,
++	kExtCapMaxWalk		= 64,
++	kLegSupBiosOwned	= 0x00010000u,
++	kLegSupOsOwned		= 0x01000000u,
++	/*
++	 * USBLEGCTLSTS: every SMI enable lives in 0..4, 5..12 and 17..19; the
++	 * three status bits at 29..31 are write-1-to-clear. Clearing the whole
++	 * enable span is the only formulation that is correct no matter which
++	 * of the vendor layouts a given firmware implements.
++	 */
++	kLegCtlSmiEnableBits	= 0x000E1FFFu,
++	kLegCtlSmiEvents	= 0xE0000000u
++};
++
++/* ------------------------------------------------------------------------- */
++/* Result flags                                                              */
++/* ------------------------------------------------------------------------- */
++enum
++{
++	kFlagPhantom		= 1u << 0,	/* no usable controller behind BAR0 */
++	kFlagBailSafe		= 1u << 1,	/* nothing at all was written */
++	kFlagRegFault		= 1u << 2,	/* a MMIO read returned ~0 mid-flight */
++	kFlagCnrTimeout		= 1u << 3,
++	kFlagLegacyMissing	= 1u << 4,
++	kFlagHandoffForced	= 1u << 5,	/* BIOS semaphore had to be cleared by force */
++	kFlagHandoffTimeout	= 1u << 6,
++	kFlagHalted		= 1u << 7,
++	kFlagResetOk		= 1u << 8,
++	kFlagResetTimeout	= 1u << 9,
++	kFlagRingsZeroed	= 1u << 10,
++	kFlagPortsCleared	= 1u << 11,
++	kFlagRxDetectForced	= 1u << 12,
++	kFlagMsiOff		= 1u << 13,
++	kFlagSkew		= 1u << 14	/* port loop hit a register fault */
++};
++
++enum
++{
++	kStatusOk	= 0,
++	kStatusWarn	= 1,
++	kStatusBailed	= 2
++};
++
++/* ------------------------------------------------------------------------- */
++/* I/O back end                                                              */
++/* ------------------------------------------------------------------------- */
++struct Io
++{
++	void*		ctx;
++	/* MMIO: offset is relative to BAR0, *fault is set when the read is bogus */
++	uint32_t	(*read32)(void* ctx, uint32_t off, bool* fault);
++	void		(*write32)(void* ctx, uint32_t off, uint32_t val);
++	uint8_t		(*read8)(void* ctx, uint32_t off, bool* fault);
++	/* PCI config space */
++	uint8_t		(*cfg_read8)(void* ctx, uint8_t off);
++	uint16_t	(*cfg_read16)(void* ctx, uint8_t off);
++	void		(*cfg_write16)(void* ctx, uint8_t off, uint16_t val);
++	/* timing / logging */
++	void		(*sleep_ms)(void* ctx, uint32_t ms);
++	uint32_t	(*spent_ms)(void* ctx);
++	void		(*log)(void* ctx, const char* msg);
++
++	uint32_t	bar_size;
++	uint16_t	vendor;
++	uint16_t	device;
++};
++
++struct Options
++{
++	bool		handoff;		/* touch the legacy support capability */
++	bool		reset;			/* halt + host controller reset */
++	bool		ports;			/* clear port change bits / unstick PLS */
++	bool		msi;			/* disable MSI and MSI-X enables */
++	bool		rxdetect_all;		/* force RxDetect on every port, not only stuck ones */
++	uint32_t	cnr_ms;			/* wait for CNR to drain, per attempt */
++	uint32_t	halt_ms;		/* wait for HCH after clearing RS */
++	uint32_t	reset_ms;		/* wait for HCRST to self-clear, per attempt */
++	uint32_t	handoff_ms;		/* wait for BIOS_OWNED to clear */
++	uint32_t	reset_retries;		/* total HCRST attempts, >= 1 */
++	uint32_t	max_total_ms;		/* hard ceiling for the whole preflight */
++	int		log_level;		/* 0 silent, 1 one line, 2 verbose */
++};
++
++struct Report
++{
++	int		status;
++	uint32_t	flags;
++	uint16_t	vendor;
++	uint16_t	device;
++	uint32_t	bar_size;
++	uint16_t	hci_version;
++	uint8_t		cap_length;
++	uint8_t		num_ports;
++	uint8_t		num_slots;
++	uint16_t	num_intrs;
++	uint32_t	legs_off;		/* 0xFFFFFFFF when absent */
++	uint32_t	cmd_before;
++	uint32_t	sts_before;
++	uint32_t	cmd_after;
++	uint32_t	sts_after;
++	uint32_t	wait_cnr_ms;
++	uint32_t	wait_halt_ms;
++	uint32_t	wait_reset_ms;
++	uint32_t	wait_handoff_ms;
++	uint32_t	total_ms;
++	uint32_t	rxdetect_mask_lo;	/* ports 0..31 */
++	uint32_t	rxdetect_mask_hi;	/* ports 32..63 */
++	uint8_t		reset_attempts;
++	uint8_t		msi_state;		/* 1 = MSI disabled, 2 = MSI-X disabled */
++	char		line[256];
++};
++
++/* ------------------------------------------------------------------------- */
++/* Tiny string builder (no snprintf in the kernel)                           */
++/* ------------------------------------------------------------------------- */
++struct Out
++{
++	char*		buf;
++	uint32_t	cap;
++	uint32_t	len;
++};
++
++static inline void out_char(Out& o, char c)
++{
++	if (o.len + 1u < o.cap) {
++		o.buf[o.len] = c;
++		o.buf[o.len + 1u] = 0;
++	}
++	++o.len;
++}
++
++static inline void out_str(Out& o, const char* s)
++{
++	if (!s)
++		return;
++	while (*s)
++		out_char(o, *s++);
++}
++
++static inline void out_dec(Out& o, uint32_t v)
++{
++	char tmp[10];
++	int n = 0;
++	if (!v) {
++		out_char(o, '0');
++		return;
++	}
++	while (v && n < (int)sizeof tmp) {
++		tmp[n++] = (char)('0' + (v % 10u));
++		v /= 10u;
++	}
++	while (n--)
++		out_char(o, tmp[n]);
++}
++
++static inline void out_hex(Out& o, uint32_t v, int digits)
++{
++	static const char kHex[] = "0123456789abcdef";
++	out_str(o, "0x");
++	if (v == 0u) {
++		out_char(o, '0');
++		return;
++	}
++	if (digits < 1)
++		digits = 8;
++	while (digits-- > 0)
++		out_char(o, kHex[(v >> (digits * 4)) & 0xFu]);
++}
++
++static inline void out_kv(Out& o, const char* k, uint32_t v)
++{
++	out_char(o, ' ');
++	out_str(o, k);
++	out_char(o, '=');
++	out_dec(o, v);
++}
++
++static inline void out_kvhex(Out& o, const char* k, uint32_t v, int digits)
++{
++	out_char(o, ' ');
++	out_str(o, k);
++	out_char(o, '=');
++	out_hex(o, v, digits);
++}
++
++static inline void out_kvs(Out& o, const char* k, const char* v)
++{
++	out_char(o, ' ');
++	out_str(o, k);
++	out_char(o, '=');
++	out_str(o, v);
++}
++
++/* ------------------------------------------------------------------------- */
++/* Options / report helpers                                                  */
++/* ------------------------------------------------------------------------- */
++static inline void Defaults(Options* o)
++{
++	o->handoff	= true;
++	o->reset	= true;
++	o->ports	= true;
++	o->msi		= true;
++	o->rxdetect_all	= false;
++	o->cnr_ms	= 1200u;
++	o->halt_ms	= 250u;
++	o->reset_ms	= 1000u;
++	o->handoff_ms	= 1000u;
++	o->reset_retries = 2u;
++	o->max_total_ms	= 5000u;
++	o->log_level	= 1;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Low level helpers                                                         */
++/* ------------------------------------------------------------------------- */
++static inline uint32_t rd32(const Io& io, uint32_t off, bool* fault)
++{
++	if (off + 4u > io.bar_size) {
++		*fault = true;
++		return 0xFFFFFFFFu;
++	}
++	uint32_t v = io.read32(io.ctx, off, fault);
++	if (v == 0xFFFFFFFFu)
++		*fault = true;
++	return v;
++}
++
++static inline void wr32(const Io& io, uint32_t off, uint32_t v)
++{
++	if (off + 4u <= io.bar_size)
++		io.write32(io.ctx, off, v);
++}
++
++static inline uint8_t rd8(const Io& io, uint32_t off, bool* fault)
++{
++	if (off + 1u > io.bar_size) {
++		*fault = true;
++		return 0xFFu;
++	}
++	return io.read8(io.ctx, off, fault);
++}
++
++static inline void nap(const Io& io, uint32_t ms)
++{
++	if (ms)
++		io.sleep_ms(io.ctx, ms);
++}
++
++static inline void say(const Io& io, const char* msg)
++{
++	if (io.log)
++		io.log(io.ctx, msg);
++}
++
++/*
++ * Poll a MMIO register until (v & mask) == target. Returns elapsed ms, or
++ * kWaitTimeout when the budget ran out. Reads that fault abort immediately.
++ */
++enum { kWaitTimeout = 0xFFFFFFFFu };
++
++static inline uint32_t wait_reg(const Io& io, uint32_t off, uint32_t mask,
++				uint32_t target, uint32_t budget_ms, bool* fault)
++{
++	uint32_t start = io.spent_ms(io.ctx);
++	for (;;) {
++		bool f = false;
++		uint32_t v = rd32(io, off, &f);
++		if (f) {
++			*fault = true;
++			return io.spent_ms(io.ctx) - start;
++		}
++		if ((v & mask) == target)
++			return io.spent_ms(io.ctx) - start;
++		if (io.spent_ms(io.ctx) - start >= budget_ms)
++			return kWaitTimeout;
++		nap(io, 1u);
++	}
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 1: is there a controller at all?                                    */
++/* ------------------------------------------------------------------------- */
++static inline bool Classify(const Io& io, Report* r)
++{
++	bool f = false;
++
++	if (io.bar_size < 0x1000u) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++
++	uint32_t cap0 = rd32(io, kRegCapBase, &f);	/* CapLength + HCIVersion */
++	if (f) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	r->cap_length	= (uint8_t)(cap0 & 0xFFu);
++	r->hci_version	= (uint16_t)((cap0 >> 16) & 0xFFFFu);
++
++	uint32_t hcs1 = rd32(io, kRegHcsParams1, &f);
++	if (f || hcs1 == 0u) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	r->num_slots	= (uint8_t)(hcs1 & 0xFFu);
++	r->num_intrs	= (uint16_t)((hcs1 >> 8) & 0x7FFu);
++	r->num_ports	= (uint8_t)((hcs1 >> 24) & 0xFFu);
++
++	if (r->cap_length < kCapLengthMin || r->cap_length > kCapLengthMax) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	if (r->hci_version < kHciVersionMin || r->hci_version > kHciVersionMax) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	if (r->num_ports == 0u || r->num_ports > kMaxPorts || r->num_slots == 0u) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	if ((uint32_t)r->cap_length + 0x400u + (uint32_t)r->num_ports * kOpPortStride >
++	    io.bar_size) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++
++	/* The operational block must be readable too. */
++	(void)rd32(io, (uint32_t)r->cap_length + kOpUsbSts, &f);
++	if (f) {
++		r->flags |= kFlagPhantom;
++		return false;
++	}
++	return true;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 2: extended capabilities walk                                       */
++/* ------------------------------------------------------------------------- */
++static inline uint32_t find_legacy_cap(const Io& io, Report* r)
++{
++	bool f = false;
++	uint32_t hcc = rd32(io, kRegHccParams, &f);
++	if (f)
++		return 0xFFFFFFFFu;
++	uint32_t dword = (hcc >> 16) & 0xFFFFu;
++	if (dword < 0x40u)
++		return 0xFFFFFFFFu;
++
++	uint32_t prev = 0u;
++	for (unsigned i = 0u; i < (unsigned)kExtCapMaxWalk; ++i) {
++		uint32_t off = dword << 2;
++		if (off + 4u > io.bar_size)
++			break;
++		if (i && dword <= prev)		/* no forward progress: bail out */
++			break;
++		uint32_t d = rd32(io, off, &f);
++		if (f)
++			break;
++		uint8_t id   = (uint8_t)(d & 0xFFu);
++		uint8_t next = (uint8_t)((d >> 8) & 0xFFu);
++		prev = dword;
++		if (id == kExtCapLegacySup) {
++			r->legs_off = off;
++			return off;
++		}
++		if (!next)
++			break;
++		dword += next;
++	}
++	return 0xFFFFFFFFu;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 3: legacy support hand-off                                          */
++/* ------------------------------------------------------------------------- */
++static inline void do_handoff(const Io& io, const Options& opt, Report* r)
++{
++	uint32_t off = find_legacy_cap(io, r);
++	if (off == 0xFFFFFFFFu) {
++		r->flags |= kFlagLegacyMissing;
++		return;
++	}
++	bool f = false;
++	/* USBLEGCTLSTS lives at cap + 8: mask every SMI enable, ack W1C events. */
++	uint32_t ctl = rd32(io, off + 8u, &f);
++	if (f) {
++		r->flags |= kFlagHandoffTimeout;
++		return;
++	}
++	wr32(io, off + 8u, (ctl & ~kLegCtlSmiEnableBits) | kLegCtlSmiEvents);
++
++	/* USBLEGSUP lives at cap + 4. */
++	uint32_t sup = rd32(io, off + 4u, &f);
++	if (f) {
++		r->flags |= kFlagHandoffTimeout;
++		return;
++	}
++	if (!(sup & kLegSupBiosOwned)) {
++		if (!(sup & kLegSupOsOwned))
++			wr32(io, off + 4u, sup | kLegSupOsOwned);
++		return;
++	}
++	wr32(io, off + 4u, sup | kLegSupOsOwned);
++	uint32_t waited = wait_reg(io, off + 4u, kLegSupBiosOwned, 0u,
++				  opt.handoff_ms, &f);
++	r->wait_handoff_ms = (waited == kWaitTimeout) ? opt.handoff_ms : waited;
++	if (f) {
++		r->flags |= kFlagHandoffTimeout;
++		return;
++	}
++	if (waited == kWaitTimeout) {
++		/*
++		 * BIOS did not let go. Clear the semaphore by hand and keep the
++		 * OS-owned bit: the firmware SMI handler is already masked above,
++		 * so nothing can raise it again.
++		 */
++		r->flags |= kFlagHandoffForced;
++		wr32(io, off + 4u, (sup | kLegSupOsOwned) & ~kLegSupBiosOwned);
++	}
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 4/5: halt and reset                                                 */
++/* ------------------------------------------------------------------------- */
++static inline bool do_halt(const Io& io, const Options& opt, Report* r)
++{
++	bool f = false;
++	uint32_t cmd = rd32(io, (uint32_t)r->cap_length + kOpUsbCmd, &f);
++	if (f) {
++		r->flags |= kFlagRegFault;
++		return false;
++	}
++	uint32_t quiet = cmd & ~(kCmdRunStop | kCmdIntEn | kCmdHsErrEn | kCmdWrapEvent);
++	if (quiet != cmd)
++		wr32(io, (uint32_t)r->cap_length + kOpUsbCmd, quiet);
++	r->cmd_before = cmd;
++
++	if (!(cmd & kCmdRunStop)) {
++		r->flags |= kFlagHalted;		/* already stopped */
++		return true;
++	}
++	uint32_t waited = wait_reg(io, (uint32_t)r->cap_length + kOpUsbSts,
++				   kStsHalted, kStsHalted, opt.halt_ms, &f);
++	r->wait_halt_ms = (waited == kWaitTimeout) ? opt.halt_ms : waited;
++	if (f)
++		r->flags |= kFlagRegFault;
++	if (waited == kWaitTimeout)
++		return false;
++	r->flags |= kFlagHalted;
++	return true;
++}
++
++static inline void do_reset(const Io& io, const Options& opt, Report* r)
++{
++	uint32_t op = r->cap_length;
++	uint32_t attempts = opt.reset_retries ? opt.reset_retries : 1u;
++	bool f = false;
++
++	for (uint32_t i = 0; i < attempts; ++i) {
++		r->reset_attempts = (uint8_t)(i + 1u);
++		/* A ring pointer left over from firmware confuses the reset. */
++		wr32(io, op + kOpCrcrLo, 0u);
++		wr32(io, op + kOpCrcrHi, 0u);
++
++		uint32_t cmd = rd32(io, op + kOpUsbCmd, &f);
++		if (f) {
++			r->flags |= kFlagRegFault;
++			return;
++		}
++		wr32(io, op + kOpUsbCmd, (cmd & ~kCmdRunStop) | kCmdReset);
++
++		uint32_t waited = wait_reg(io, op + kOpUsbCmd, kCmdReset, 0u,
++					   opt.reset_ms, &f);
++		r->wait_reset_ms += (waited == kWaitTimeout) ? opt.reset_ms : waited;
++		if (f) {
++			r->flags |= kFlagRegFault;
++			return;
++		}
++		if (waited == kWaitTimeout)
++			continue;	/* try again */
++
++		/* Reset went through: wait for the controller to become ready. */
++		waited = wait_reg(io, op + kOpUsbSts, kStsNotReady, 0u,
++				  opt.cnr_ms, &f);
++		r->wait_cnr_ms += (waited == kWaitTimeout) ? opt.cnr_ms : waited;
++		if (f) {
++			r->flags |= kFlagRegFault;
++			return;
++		}
++		if (waited == kWaitTimeout)
++			r->flags |= kFlagCnrTimeout;
++
++		r->flags |= kFlagResetOk;
++		return;
++	}
++	r->flags |= kFlagResetTimeout;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 6: leave no firmware DMA state behind                               */
++/* ------------------------------------------------------------------------- */
++static inline void do_zero_rings(const Io& io, Report* r)
++{
++	/*
++	 * Only safe when the controller is stopped. Writing DCBAAP while RS is
++	 * still set would make the HC fetch slot pointers from address zero.
++	 */
++	if (!(r->flags & (kFlagHalted | kFlagResetOk)))
++		return;
++	uint32_t op = r->cap_length;
++	wr32(io, op + kOpCrcrLo, 0u);
++	wr32(io, op + kOpCrcrHi, 0u);
++	wr32(io, op + kOpDcbaapLo, 0u);
++	wr32(io, op + kOpDcbaapHi, 0u);
++	wr32(io, op + kOpConfig, 0u);
++	r->flags |= kFlagRingsZeroed;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 7: status and port clean-up                                         */
++/* ------------------------------------------------------------------------- */
++static inline void do_ports(const Io& io, const Options& opt, Report* r)
++{
++	uint32_t op = r->cap_length;
++	bool f = false;
++
++	/* W1C the controller level change bits. */
++	wr32(io, op + kOpUsbSts, kStsHsErr | kStsEventInt | kStsPortChange | kStsSaveRestErr);
++
++	uint32_t cleared = 0u;
++	for (uint32_t p = 0; p < (uint32_t)r->num_ports; ++p) {
++		uint32_t off = op + kOpPortBase + p * kOpPortStride;
++		uint32_t psc = rd32(io, off, &f);
++		if (f) {
++			r->flags |= kFlagSkew;
++			break;
++		}
++		uint32_t pls = (psc >> 5) & 0xFu;
++		uint32_t w = (psc & kPortWriteBack) | kPortChangeBits;
++		bool stuck = (pls == kLinkPolling || pls == kLinkRecovery ||
++			      pls == kLinkHotReset || pls == kLinkCompliance ||
++			      pls == kLinkLoopback);
++		if (stuck || opt.rxdetect_all) {
++			w |= kPortLinkWrStrobe | ((uint32_t)kLinkRxDetect << 5);
++			if (p < 32u)
++				r->rxdetect_mask_lo |= (1u << p);
++			else
++				r->rxdetect_mask_hi |= (1u << (p - 32u));
++			r->flags |= kFlagRxDetectForced;
++		}
++		wr32(io, off, w);
++		++cleared;
++	}
++	if (cleared)
++		r->flags |= kFlagPortsCleared;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Stage 8: PCI level interrupt deconfiguration                              */
++/* ------------------------------------------------------------------------- */
++static inline void do_msi(const Io& io, Report* r)
++{
++	uint8_t cap = (uint8_t)(io.cfg_read8(io.ctx, kPciCapPtr) & 0xFCu);
++	for (int guard = 0; guard < 48 && cap >= 0x40u; ++guard) {
++		uint8_t id   = io.cfg_read8(io.ctx, cap);
++		uint8_t next = (uint8_t)(io.cfg_read8(io.ctx, (uint8_t)(cap + 1u)) & 0xFCu);
++		if (id == kPciCapMsi) {
++			uint16_t mc = io.cfg_read16(io.ctx, (uint8_t)(cap + 2u));
++			if (mc & 0x0001u) {
++				io.cfg_write16(io.ctx, (uint8_t)(cap + 2u), (uint16_t)(mc & ~0x0001u));
++				r->msi_state |= 1u;
++			}
++		} else if (id == kPciCapMsix) {
++			uint16_t mc = io.cfg_read16(io.ctx, (uint8_t)(cap + 2u));
++			if (mc & 0x8000u) {
++				io.cfg_write16(io.ctx, (uint8_t)(cap + 2u), (uint16_t)(mc & ~0x8000u));
++				r->msi_state |= 2u;
++			}
++		}
++		if (!next || next == cap)
++			break;
++		cap = next;
++	}
++	if (r->msi_state)
++		r->flags |= kFlagMsiOff;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Report line                                                               */
++/* ------------------------------------------------------------------------- */
++static inline void build_line(Report* r)
++{
++	Out o = { r->line, sizeof r->line, 0 };
++	r->line[0] = 0;
++
++	out_str(o, r->status == kStatusOk ? "ok" :
++		   r->status == kStatusWarn ? "warn" : "bailed");
++	out_char(o, ' ');
++	out_hex(o, r->vendor, 4);
++	out_char(o, ':');
++	out_hex(o, r->device, 4);
++	out_kvhex(o, "cap", r->cap_length, 2);
++	out_kvhex(o, "ver", r->hci_version, 4);
++	out_kv(o, "ports", r->num_ports);
++	out_kv(o, "slots", r->num_slots);
++	if (r->legs_off != 0xFFFFFFFFu)
++		out_kvhex(o, "legs", r->legs_off, 3);
++	out_kvs(o, "ho", (r->flags & kFlagHandoffForced) ? "forced" :
++			(r->flags & kFlagHandoffTimeout) ? "fail" :
++			(r->flags & kFlagLegacyMissing) ? "none" : "ok");
++	out_kvs(o, "rst", (r->flags & kFlagResetOk) ? "ok" : "fail");
++	if (r->flags & kFlagResetOk) {
++		out_char(o, '/');
++		out_dec(o, r->wait_reset_ms);
++		out_str(o, "ms");
++	}
++	out_kvhex(o, "rx", r->rxdetect_mask_lo, 8);
++	out_kvhex(o, "rxhi", r->rxdetect_mask_hi, 8);
++	out_kv(o, "msi", r->msi_state);
++	out_kv(o, "t", r->total_ms);
++	out_char(o, ' ');
++	out_str(o, "flags=");
++	out_hex(o, r->flags, 4);
++}
++
++/* ------------------------------------------------------------------------- */
++/* Entry point                                                               */
++/* ------------------------------------------------------------------------- */
++static inline Report Run(const Io& io, const Options& opt)
++{
++	Report r;
++	{
++		uint8_t* p = (uint8_t*)&r;
++		for (uint32_t i = 0; i < (uint32_t)sizeof r; ++i)
++			p[i] = 0;
++	}
++	r.vendor	= io.vendor;
++	r.device	= io.device;
++	r.bar_size	= io.bar_size;
++	r.legs_off	= 0xFFFFFFFFu;
++	r.status	= kStatusBailed;
++	r.flags		= kFlagBailSafe;
++
++	if (!Classify(io, &r))
++		goto out;
++	r.flags &= ~kFlagBailSafe;
++	r.status = kStatusOk;
++
++	{
++		uint32_t op = r.cap_length;
++		bool f = false;
++		r.sts_before = rd32(io, op + kOpUsbSts, &f);
++		if (f) {
++			r.flags |= kFlagRegFault;
++			goto done;
++		}
++
++		/* CNR must be clear before anything can be programmed. */
++		if (r.sts_before & kStsNotReady) {
++			uint32_t w = wait_reg(io, op + kOpUsbSts, kStsNotReady, 0u,
++					      opt.cnr_ms, &f);
++			r.wait_cnr_ms = (w == kWaitTimeout) ? opt.cnr_ms : w;
++			if (f) {
++				r.flags |= kFlagRegFault;
++				goto done;
++			}
++			if (w == kWaitTimeout)
++				r.flags |= kFlagCnrTimeout;
++		}
++	}
++
++	if (opt.handoff)
++		do_handoff(io, opt, &r);
++
++	if (opt.reset) {
++		do_halt(io, opt, &r);
++		do_reset(io, opt, &r);
++	}
++
++	do_zero_rings(io, &r);
++
++	if (opt.ports)
++		do_ports(io, opt, &r);
++
++	if (opt.msi)
++		do_msi(io, &r);
++
++done:
++	{
++		uint32_t op = r.cap_length;
++		bool f = false;
++		r.cmd_after = rd32(io, op + kOpUsbCmd, &f);
++		r.sts_after = rd32(io, op + kOpUsbSts, &f);
++	}
++
++	if (r.flags & (kFlagCnrTimeout | kFlagResetTimeout | kFlagHandoffTimeout |
++		       kFlagRegFault | kFlagSkew))
++		r.status = kStatusWarn;
++	else
++		r.status = kStatusOk;
++
++out:
++	r.total_ms = io.spent_ms(io.ctx);
++	build_line(&r);
++	if (opt.log_level >= 1)
++		say(io, r.line);
++	return r;
++}
++
++} /* namespace amdxhci */
++
++#endif /* AMDXHCI_PREFLIGHT_H */
+diff --git a/GenericUSBXHCI/GenericUSBXHCI-Info.plist b/GenericUSBXHCI/GenericUSBXHCI-Info.plist
+index 87e0b6c..ad95ce6 100644
+--- a/GenericUSBXHCI/GenericUSBXHCI-Info.plist
++++ b/GenericUSBXHCI/GenericUSBXHCI-Info.plist
+@@ -45,7 +45,7 @@
+ 			<key>IOUserClientClass</key>
+ 			<string>IOUSBControllerUserClient</string>
+ 			<key>IOProbeScore</key>
+-			<integer>1</integer>
++			<integer>10000</integer>
+ 			<key>ASMediaEDLTAFix</key>
+ 			<true/>
+ 			<key>IntelDoze</key>
+diff --git a/GenericUSBXHCI/V1Pure.cpp b/GenericUSBXHCI/V1Pure.cpp
+index 5add4b8..a2962fa 100755
+--- a/GenericUSBXHCI/V1Pure.cpp
++++ b/GenericUSBXHCI/V1Pure.cpp
+@@ -11,11 +11,207 @@
+ #include "XHCITRB.h"
+ #include "XHCITypes.h"
+ #include <IOKit/IOFilterInterruptEventSource.h>
++#include <pexpert/pexpert/boot.h>
++#include "AMDXHCIPreflight.h"
+ #include "../IOKit-10.10/IOUSBRootHubDevice.h"
+ 
+ #define CLASS GenericUSBXHCI
+ #define super IOUSBControllerV3
+ 
++#pragma mark -
++#pragma mark AMD xHCI preflight
++#pragma mark -
++
++/*
++ * Runs before AppleUSBXHCIPCI can probe the same controller and leaves the
++ * hardware halted, reset, free of firmware DMA state and with the legacy
++ * support semaphore taken over. See AMDXHCIPreflight.h for the details and
++ * README.md for why each step is needed on AMD platforms.
++ */
++static_assert(__builtin_offsetof(struct XHCICapRegisters, HCCParams) == 0x10U, "HCCParams offset");
++static_assert(__builtin_offsetof(struct XHCIOpRegisters, USBSts) == 0x04U, "USBSts offset");
++static_assert(__builtin_offsetof(struct XHCIOpRegisters, CRCr) == 0x18U, "CRCr offset");
++static_assert(__builtin_offsetof(struct XHCIOpRegisters, DCBAap) == 0x30U, "DCBAap offset");
++static_assert(__builtin_offsetof(struct XHCIOpRegisters, Config) == 0x38U, "Config offset");
++static_assert(__builtin_offsetof(struct XHCIOpRegisters, prs) == 0x400U, "PortSC base offset");
++
++struct AmdXhciPreflightCtx
++{
++	IOPCIDevice*		device;
++	volatile uint8_t*	base;
++	uint32_t		size;
++	uint32_t		spent;
++};
++
++static uint32_t amdxhci_pf_read32(void* ctx, uint32_t off, bool* fault)
++{
++	AmdXhciPreflightCtx* c = static_cast<AmdXhciPreflightCtx*>(ctx);
++	if (off + 4U > c->size) {
++		*fault = true;
++		return 0xFFFFFFFFU;
++	}
++	uint32_t v = *reinterpret_cast<volatile uint32_t const*>(c->base + off);
++	if (v == 0xFFFFFFFFU)
++		*fault = true;
++	return v;
++}
++
++static void amdxhci_pf_write32(void* ctx, uint32_t off, uint32_t val)
++{
++	AmdXhciPreflightCtx* c = static_cast<AmdXhciPreflightCtx*>(ctx);
++	if (off + 4U <= c->size)
++		*reinterpret_cast<volatile uint32_t*>(c->base + off) = val;
++}
++
++static uint8_t amdxhci_pf_read8(void* ctx, uint32_t off, bool* fault)
++{
++	AmdXhciPreflightCtx* c = static_cast<AmdXhciPreflightCtx*>(ctx);
++	if (off + 1U > c->size) {
++		*fault = true;
++		return 0xFFU;
++	}
++	uint8_t v = *reinterpret_cast<volatile uint8_t const*>(c->base + off);
++	if (v == 0xFFU)
++		*fault = true;
++	return v;
++}
++
++static uint8_t amdxhci_pf_cfg8(void* ctx, uint8_t off)
++{
++	return static_cast<AmdXhciPreflightCtx*>(ctx)->device->configRead8(off);
++}
++
++static uint16_t amdxhci_pf_cfg16(void* ctx, uint8_t off)
++{
++	return static_cast<AmdXhciPreflightCtx*>(ctx)->device->configRead16(off);
++}
++
++static void amdxhci_pf_cfgw16(void* ctx, uint8_t off, uint16_t val)
++{
++	static_cast<AmdXhciPreflightCtx*>(ctx)->device->configWrite16(off, val);
++}
++
++static void amdxhci_pf_sleep(void* ctx, uint32_t ms)
++{
++	AmdXhciPreflightCtx* c = static_cast<AmdXhciPreflightCtx*>(ctx);
++	c->spent += ms;
++	IOSleep(ms);
++}
++
++static uint32_t amdxhci_pf_spent(void* ctx)
++{
++	return static_cast<AmdXhciPreflightCtx*>(ctx)->spent;
++}
++
++static void amdxhci_pf_log(void* ctx, const char* msg)
++{
++	static_cast<void>(ctx);
++	IOLog("AMDXHCIPreflight: %s\n", msg);
++}
++
++static void amdxhci_pf_options(amdxhci::Options* opt)
++{
++	uint32_t v;
++
++	amdxhci::Defaults(opt);
++	if (PE_parse_boot_argn("-amdxhci_nohandoff", &v, sizeof v))
++		opt->handoff = false;
++	if (PE_parse_boot_argn("-amdxhci_noreset", &v, sizeof v))
++		opt->reset = false;
++	if (PE_parse_boot_argn("-amdxhci_noports", &v, sizeof v))
++		opt->ports = false;
++	if (PE_parse_boot_argn("-amdxhci_nomsi", &v, sizeof v))
++		opt->msi = false;
++	if (PE_parse_boot_argn("-amdxhci_rxdetect_all", &v, sizeof v))
++		opt->rxdetect_all = true;
++	if (PE_parse_boot_argn("amdxhci_cnr_ms", &v, sizeof v) && v)
++		opt->cnr_ms = v;
++	if (PE_parse_boot_argn("amdxhci_reset_ms", &v, sizeof v) && v)
++		opt->reset_ms = v;
++	if (PE_parse_boot_argn("amdxhci_handoff_ms", &v, sizeof v) && v)
++		opt->handoff_ms = v;
++	if (PE_parse_boot_argn("amdxhci_retries", &v, sizeof v) && v && v <= 8U)
++		opt->reset_retries = v;
++	if (PE_parse_boot_argn("amdxhci_log", &v, sizeof v))
++		opt->log_level = static_cast<int>(v);
++}
++
++/*
++ * Put the function into D0 and make sure memory decoding and bus mastering are
++ * both on. Firmware may hand the controller over in D3 or with bus mastering
++ * off, and touching the registers in that state is what wedges a boot.
++ */
++static void amdxhci_pf_pci_prepare(IOPCIDevice* device)
++{
++	uint16_t cmd = device->configRead16(kIOPCIConfigCommand);
++	uint16_t want = static_cast<uint16_t>(cmd | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
++
++	if (want != cmd)
++		device->configWrite16(kIOPCIConfigCommand, want);
++
++	UInt8 pmOff = 0;
++	if (device->findPCICapability(1U, &pmOff) && pmOff >= 0x40U) {
++		uint16_t pmcsr = device->configRead16(static_cast<uint8_t>(pmOff + 4U));
++		if (pmcsr & 3U) {
++			device->configWrite16(static_cast<uint8_t>(pmOff + 4U),
++					      static_cast<uint16_t>(pmcsr & ~3U));
++			IOSleep(10);
++		}
++	}
++}
++
++static void amdxhci_pf_run(IOPCIDevice* device, IOMemoryMap* map)
++{
++	AmdXhciPreflightCtx ctx;
++	amdxhci::Io io;
++	amdxhci::Options opt;
++	amdxhci::Report report;
++	uint32_t v;
++
++	if (!map || !map->getVirtualAddress()) {
++		device->setProperty("amdxhci-preflight", "no BAR0 mapping");
++		return;
++	}
++	ctx.device	= device;
++	ctx.base	= reinterpret_cast<volatile uint8_t*>(map->getVirtualAddress());
++	ctx.size	= static_cast<uint32_t>(map->getLength());
++	ctx.spent	= 0;
++
++	amdxhci_pf_options(&opt);
++	if (PE_parse_boot_argn("-amdxhci_off", &v, sizeof v)) {
++		device->setProperty("amdxhci-preflight", "disabled by boot-arg");
++		return;
++	}
++
++	io.ctx		= &ctx;
++	io.read32	= amdxhci_pf_read32;
++	io.write32	= amdxhci_pf_write32;
++	io.read8	= amdxhci_pf_read8;
++	io.cfg_read8	= amdxhci_pf_cfg8;
++	io.cfg_read16	= amdxhci_pf_cfg16;
++	io.cfg_write16	= amdxhci_pf_cfgw16;
++	io.sleep_ms	= amdxhci_pf_sleep;
++	io.spent_ms	= amdxhci_pf_spent;
++	io.log		= amdxhci_pf_log;
++	io.bar_size	= ctx.size;
++	io.vendor	= device->configRead16(kIOPCIConfigVendorID);
++	io.device	= device->configRead16(kIOPCIConfigDeviceID);
++
++	device->setProperty("amdxhci-preflight-enabled", true);
++	amdxhci_pf_pci_prepare(device);
++	report = amdxhci::Run(io, opt);
++
++	device->setProperty("amdxhci-preflight", report.line);
++	device->setProperty("amdxhci-status", static_cast<unsigned long long>(report.status), 32U);
++	device->setProperty("amdxhci-flags", static_cast<unsigned long long>(report.flags), 32U);
++	device->setProperty("amdxhci-ports", static_cast<unsigned long long>(report.num_ports), 32U);
++	device->setProperty("amdxhci-legacy-cap", static_cast<unsigned long long>(report.legs_off), 32U);
++	device->setProperty("amdxhci-reset-attempts", static_cast<unsigned long long>(report.reset_attempts), 32U);
++	device->setProperty("amdxhci-total-ms", static_cast<unsigned long long>(report.total_ms), 32U);
++	if (report.flags & amdxhci::kFlagPhantom)
++		device->setProperty("amdxhci-phantom", true);
++}
++
+ #pragma mark -
+ #pragma mark IOUSBController Pure
+ #pragma mark -
+@@ -63,11 +259,32 @@ IOReturn CLASS::UIMInitialize(IOService* provider)
+ 	}
+ #endif
+ 	/*
+-	 * TBD: This also disables bus-mastering.  Bios may still
+-	 *   own the xHC.  Is that a problem?
++	 * Read-modify-write: the original plain write also cleared bus mastering
++	 * while the BIOS could still own the xHC and be DMA'ing into it. On AMD
++	 * boards that is a reliable way to get a PCIe UR/AER storm during boot.
++	 */
++	{
++		uint16_t pciCmd = _device->configRead16(kIOPCIConfigCommand);
++		uint16_t pciWant = static_cast<uint16_t>(pciCmd | kIOPCICommandMemorySpace |
++							 kIOPCICommandBusMaster);
++		if (pciWant != pciCmd)
++			_device->configWrite16(kIOPCIConfigCommand, pciWant);
++	}
++	/*
++	 * This fork used to bail out much further down with an IOLog and a
++	 * UIMFinalize(). All that did to the hardware was map BAR0 and enable
++	 * memory decoding, so whether AppleUSBXHCIPCI found the controller in a
++	 * usable state depended on firmware leftovers, probe order and whether a
++	 * device happened to be plugged in. That is the intermittent boot hang.
++	 *
++	 * Do the hand-over properly instead: put the function in D0, take the
++	 * legacy semaphore, halt, reset, drop every piece of firmware DMA state
++	 * and disarm MSI/MSI-X, so the next driver always starts from the same
++	 * clean slate. The remainder of this function is never reached.
+ 	 */
+-	// enable the card registers
+-	_device->configWrite16(kIOPCIConfigCommand, kIOPCICommandMemorySpace);
++	amdxhci_pf_run(_device, _deviceBase);
++	UIMFinalize();
++	return kIOReturnUnsupported;
+ #if 0
+ 	uint16_t hciv = Read16Reg(&_pXHCICapRegisters->HCIVersion);
+ 	if (m_invalid_regspace) {
+@@ -101,11 +318,11 @@ IOReturn CLASS::UIMInitialize(IOService* provider)
+ 																					  _device,
+ 																					  findInterruptIndex(_device,
+ 																										 !(_errataBits & kErrataDisableMSI)));
+-	//if (!_filterInterruptSource) {
++	if (!_filterInterruptSource) {
+ 		IOLog("%s: Unable to create filterInterruptEventSource\n", __FUNCTION__);
+ 		UIMFinalize();
+ 		return kIOReturnNoResources;
+-	//}
++	}
+ 	_baseInterruptIndex = _filterInterruptSource->getIntIndex();
+ 	rc = _workLoop->addEventSource(_filterInterruptSource);
+ 	if (rc != kIOReturnSuccess) {

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>AMDXHCIPreflight</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.yg.AMDXHCIPreflight</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AMDXHCIPreflight</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>AMDXHCIPreflight</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.yg.AMDXHCIPreflight</string>
+			<key>IOClass</key>
+			<string>com_yg_AMDXHCIPreflight</string>
+			<key>IOPCIClassMatch</key>
+			<string>0x0c033000</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!--
+			     Higher than any USB controller driver, so this candidate is
+			     always started first and always withdraws in start(), leaving
+			     a cleaned controller to AppleUSBXHCIPCI.
+			-->
+			<key>IOProbeScore</key>
+			<integer>10000</integer>
+		</dict>
+	</dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>AMD xHCI preflight, no warranty</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>12.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>12.0.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Root</string>
+</dict>
+</plist>

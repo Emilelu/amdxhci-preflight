@@ -1,0 +1,70 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  core-tests:
+    name: core logic tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (g++/clang++, three standards + sanitizers)
+        run: cd core && bash build_and_test.sh
+
+  standalone:
+    name: AMDXHCIPreflight.kext
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Type check with stub headers
+        run: cd kext/syntax-check && bash check.sh
+      - name: Build
+        run: cd kext && bash build.sh
+      - name: Inspect
+        run: |
+          set -x
+          file kext/AMDXHCIPreflight.kext/Contents/MacOS/AMDXHCIPreflight
+          otool -hv kext/AMDXHCIPreflight.kext/Contents/MacOS/AMDXHCIPreflight
+          nm -m kext/AMDXHCIPreflight.kext/Contents/MacOS/AMDXHCIPreflight | head -40
+          kextlibs -xml kext/AMDXHCIPreflight.kext || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AMDXHCIPreflight-kext
+          path: kext/AMDXHCIPreflight.kext
+
+  gux:
+    name: patched GenericUSBXHCI.kext
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch fork and apply the preflight patch
+        run: |
+          git clone https://github.com/RattletraPM/GUX-RyzenXHCIFix up
+          cd up
+          git log -1 --format='%h %s'
+          git apply --verbose "$GITHUB_WORKSPACE/gux/GUX-Preflight.patch"
+          git status --porcelain
+      - name: Build
+        run: |
+          cd up
+          xcodebuild -list -project GenericUSBXHCI.xcodeproj
+          xcodebuild clean -project GenericUSBXHCI.xcodeproj \
+            -configuration "El Capitan" -arch x86_64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
+          xcodebuild -project GenericUSBXHCI.xcodeproj \
+            -configuration "El Capitan" -arch x86_64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
+      - name: Inspect
+        run: |
+          set -x
+          find up/Build -name '*.kext' -maxdepth 3
+          K=$(find up/Build -name 'GenericUSBXHCI.kext' -maxdepth 3 | head -1)
+          file "$K/Contents/MacOS/GenericUSBXHCI"
+          otool -hv "$K/Contents/MacOS/GenericUSBXHCI"
+          plutil -p "$K/Contents/Info.plist" | head -40
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GenericUSBXHCI-patched-kext
+          path: up/Build/**/*.kext
