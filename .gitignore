@@ -1,0 +1,5 @@
+# build output — regenerate with ./build-all.sh on macOS
+out/
+.guxbuild/
+kext/AMDXHCIPreflight.kext/
+kext/build/

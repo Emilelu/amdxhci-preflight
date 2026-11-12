@@ -15,6 +15,63 @@
 
 两者共用同一份 preflight 实现（`core/AMDXHCIPreflight.h`），行为完全一致。
 
+> **在 macOS 26.7.3 (Tahoe) 上实测：方案 A 走不通，只能用方案 B。** 原因和证据见下面第 0 节。
+
+---
+
+## 0. 26.7.3 上实测的兼容性结论（先看这个）
+
+下面每一条都是在一台真实 macOS 26.7.3 (25G342, x86_64) 上跑出来的，不是推测。
+
+**0.1 GUX 声明的依赖在 Tahoe 上不存在**
+
+fork 的 `Info.plist` 写着 `com.apple.iokit.IOUSBFamily 5.0.0a1`。26.7.3 上实际的 USB 栈是：
+
+```
+com.apple.iokit.IOUSBHostFamily (1.2)          ← 改名后的 IOUSBFamily
+com.apple.driver.usb.AppleUSBXHCI (1.2)
+com.apple.driver.usb.AppleUSBXHCIPCI (1.2)
+```
+
+`IOUSBFamily` 这个名字已经没了，加载时报：
+
+```
+Unable to resolve dependencies: 'net.osx86.kexts.GenericUSBXHCI'
+names a dependency on 'com.apple.iokit.IOUSBFamily', which was not found.
+```
+
+**0.2 就算把依赖名改成 IOUSBHostFamily，符号也绑不上**
+
+GUX 全部实现建立在 `class GenericUSBXHCI : public IOUSBControllerV3` 之上，而 `IOUSBControllerV3` 的声明来自仓库自带的 `IOKit-10.10/IOUSBControllerV3.h`。Tahoe 的内核集合里既没有导出的 `IOUSBControllerV3`，也没有它依赖的 `IOUSBControllerIsochListElement::gMetaClass`：
+
+```
+nm /System/Library/KernelCollections/BootKernelExtensions.kc | grep -c IOUSBControllerV3
+0
+
+kmutil load -p GenericUSBXHCI.kext:
+Cannot find symbol for metaclass pointed to by '__ZN21GenericUSBXHCIIsochTD10superClassE'.
+Expected symbol '__ZN31IOUSBControllerIsochListElement10gMetaClassE'
+to be defined in another kext
+```
+
+也就是说：**这个 kext 在 Tahoe 上根本加载不进去**。它还能在某些机器上「起作用」，只可能是因为 OpenCore 重建内核集合时把所有 kext 一起重链，而那时它用的是 10.10 的 vtable 布局 —— 这恰好解释了为什么它在 Sonoma 之后开始偶发卡死：结构体/vtable 每版都在长，偏移对不上时，写进去的就是垃圾。
+
+**0.3 独立 kext 在 26.7.3 上是通的**
+
+`kext/build.sh` 产出的 `AMDXHCIPreflight.kext` 在这台机器上完成了完整的内核集合构建，唯一剩下的报错是策略层：
+
+```
+Extension with identifiers com.yg.AMDXHCIPreflight not approved to load.
+Please approve using System Settings.
+```
+
+这句报错出现在**依赖解析与符号绑定全部通过之后**，所以可以确认二进制结构、依赖表、kmod 入口都是对的；它只依赖 `com.apple.kpi.iokit` / `com.apple.kpi.libkern` / `com.apple.iokit.IOPCIFamily`，这三者在每个版本都稳定。真机上用 OpenCore 注入时 kext 在 UAKEL 策略之前就进了内核集合，不需要这个「批准」。
+
+> 两处非直觉的链接细节（已在 `kext/build.sh` 里处理好，否则会卡在 `kexts must have a _kmod_info symbol` 和 `Failed to bind '__realmain'`）：
+> 1. `mach/kmod.h` 里的 `_kmod_info` 必须由 kext 自己定义 —— `libkmod.a` 的 `c_start.o` 里它只是个未定义引用；
+> 2. `__realmain` 也必须自己定义：`c_start.o` 的 `__start` 是 `rax = __realmain; jmp [rax]`，即它读一个「首字段为入口函数指针」的结构。
+> 另外 plist 里必须声明 `com.apple.iokit.IOPCIFamily`，否则 `IOPCIDevice::metaClass` 绑定失败。
+
 ---
 
 ## 1. 现在这个 fork 到底在干什么
@@ -99,8 +156,8 @@ AMD 平台一般有两个 xHC（CPU 侧 + 芯片组侧），两个 `IOPCIDevice`
 | 0 | `Classify()`：BAR < 4K、cap 区读回全 1/全 0、cap_length / HCI version / ports / slots 越界 → 判为幻影控制器 | **零写入**直接退出。AMD 平台上空的 PCI 槽会被类匹配到，往幻影设备写寄存器就是挂死 |
 | 1 | PCI `Command |= MemorySpace\|BusMaster`；PMCSR 低 2 位非 0 则写 0 进 D0 | 固件常把设备留在 D3 或关着 bus-master，此时碰 MMIO 本身就是错的 |
 | 2 | 等 `USBSTS.CNR` 清零（默认 1200 ms） | CNR=1 时 HCRST 无效。超时不清也不放弃，记 `kFlagCnrTimeout` 继续 |
-| 3 | 走 XECP 链找 capId=1；**按规范偏移**写 `cap+4`（USBLEGSUP）`OS_OWNED`，轮询等 `BIOS_OWNED` 清（默认 1000 ms） | 这才是真正的 BIOS→OS 交权。超时则强制 `(sup \| OS) & ~BIOS` 并记 `kFlagHandoffForced`——**这一条是「每次都能开机」的关键：绝不等一个可能永远不来的握手** |
-| 4 | 写 `cap+8`（USBLEGCTLSTS）：清掉全部 SMI enable 位，W1C 清事件位 | BIOS 不再插手端口状态；事件位不清会在下一次交权时立刻重触发 SMI |
+| 3 | 走 XECP 链找 capId=1；在能力结构**第一个 dword**（`cap+0`，与 capId/next 同字）写 `OS_OWNED`，轮询等 `BIOS_OWNED` 清（默认 1000 ms） | 这才是真正的 BIOS→OS 交权。超时则强制 `(sup \| OS) & ~BIOS` 并记 `kFlagHandoffForced`——**这一条是「每次都能开机」的关键：绝不等一个可能永远不来的握手** |
+| 4 | 写 `cap+4`（USBLEGCTLSTS）：保留只读位（1..3、5..12、17..19），其余写 0（含 bit0 总 SMI 使能），W1C 清 29..31 | 与 Linux `pci-quirks.c` 同一套写法：BIOS 不再插手端口状态，事件位不 W1C 会在下次交权时立刻重触发 SMI |
 | 5 | 清 `USBCMD.RS/INTE/EWE/HSEE`，等 `USBSTS.HCH`（默认 250 ms） | 先把控制器停下来，否则 HCRST 会被进行中的传输拖住 |
 | 6 | 先写 `CRCR = 0`，再 `HCRST`，等 HCRST 自清 + CNR 清（默认 1000 ms，最多重试 2 次） | 清 CRCR 是为了让固件遗留的命令环指针不会在被 reset 前又被取用 |
 | 7 | 仅在确实 halt 或 reset 成功时，清 `CRCR` / `DCBAAP` / `CONFIG` | 不满足条件就清，会在 RS=1 时触发 Host System Error。这是刻意加的守卫 |
@@ -111,14 +168,20 @@ AMD 平台一般有两个 xHC（CPU 侧 + 芯片组侧），两个 `IOPCIDevice`
 
 全部关闭时典型耗时 **2 ms 量级**，最坏 ~1.3 s（全部超时叠加），并且 `max_total_ms` 硬上限 5000 ms。
 
-### 顺带修掉的两个真实 bug
+### 顺带修掉的真实问题
 
-1. **`Leaf_Methods.cpp` 的 `TakeOwnershipFromBios()` 偏移错了一个 dword。**
-   `_pUSBLegSup = (uint32_t volatile*)iter` 指向的是能力结构**起点**（capId/next 那个 dword），于是 `Read32Reg(_pUSBLegSup)` 读的不是 USBLEGSUP，`Write32Reg(_pUSBLegSup+1, ...)` 写进去的是 `(ctl & 0xE1FEE) | (7<<29)`——这个 mask 不含 bit16/bit24，等于**强行清掉 BIOS_OWNED 却从不清 OS_OWNED**，真正的 CTLSTS 一次都没被写过。按 xHCI 规范（与 Linux `pci-quirks.c`、QEMU `xhci-ext-caps` 一致）USBLEGSUP 在 cap+4、USBLEGCTLSTS 在 cap+8。
-   → preflight 用正确偏移。
-
-2. **`V1Pure.cpp` 的 `configWrite16(kIOPCIConfigCommand, kIOPCICommandMemorySpace)` 是写而不是或**，会顺手清掉 bus-master（GUX 自己的注释都承认 "This also disables bus-mastering. Bios may still own the xHC. Is that a problem?"）。
+1. **`configWrite16(kIOPCIConfigCommand, kIOPCICommandMemorySpace)` 是写而不是或**，会顺手清掉 bus-master（GUX 自己的注释都承认 "This also disables bus-mastering. Bios may still own the xHC. Is that a problem?"）。
    → 改成读-改-写 `| MemorySpace | BusMaster`。
+
+2. **BIOS→OS 交权在这个 fork 里从来没有执行过**（`TakeOwnershipFromBios()` 在早退点之后）。preflight 把它补上，并把 GUX 原来 100 ms 的等待换成 1000 ms、且超时后**强制清 semaphore**——GUX 的做法是超时只 `IOLog` 一句然后继续，等于把「BIOS 还握着控制器」这个状态原样留给下一个驱动。
+
+3. **勘误（重要）**：本文早先版本写过「GUX 的 LEGSUP 偏移错了一个 dword」，那是**错的**。复核 Linux `drivers/usb/host/xhci-ext-caps.h` 后确认：
+   ```c
+   #define XHCI_LEGACY_SUPPORT_OFFSET	(0x00)	/* USBLEGSUP */
+   #define XHCI_LEGACY_CONTROL_OFFSET	(0x04)	/* USBLEGCTLSTS */
+   ```
+   即 `BIOS_OWNED`/`OS_OWNED` 与 capId/next **共用结构第一个 dword**，GUX 的 `Read32Reg(_pUSBLegSup)` / `Write32Reg(_pUSBLegSup+1, …)` 是对的；同一文件里 `offset += next << 2` 也证实 XECP 的 `next` 是 **DWORD 增量**（与 GUX 的 `iter + iter->next` 一致）。preflight 早期版本按错误理解写成 `cap+4` / `cap+8`，已修正并有单测锁住（`legs=0x110` 那行的报告值即结构偏移）。
+   → 结论：**GUX 的寄存器偏移没错，错的是它根本没走到那段代码。**
 
 ---
 
@@ -130,17 +193,24 @@ AMD 平台一般有两个 xHC（CPU 侧 + 芯片组侧），两个 `IOPCIDevice`
 - `probe()` 里不碰任何 MMIO（probe 阶段还没有串行化保证），所有硬件动作在 `start()`；
 - 无论成功、跳过还是失败都返回 false，不持锁、不注册服务、不占设备。
 
-### 编译（需要 macOS + Xcode 命令行工具）
+### 编译（macOS，**只要命令行工具，不需要 Xcode.app**）
 
 ```bash
-cd kext
-./build.sh
-# built: .../AMDXHCIPreflight.kext
+./build-all.sh            # 单测 + 两个 kext，产物落 out/
+./build-all.sh --core-only   # 只跑宿主侧单测（Linux 也能跑）
 ```
 
-`build.sh` 用 `clang++ -mkernel -Xlinker -kext` 直接出 MH_KEXT_BUNDLE，最后 ad-hoc 签名。
+或者单独编：
 
-> ⚠️ 这个脚本是在 Windows 上写的，**没有在 macOS 上跑过**。如果链接阶段报 `-lkmod` / `libcc_kext` 找不到，走 Xcode 路线：新建 Kernel Extension target，把 `AMDXHCIPreflight.cpp` 加进去，`GCC_ENABLE_KERNEL_DEVELOPMENT = YES`，`MODULE_NAME` 留空，签名用 `-`。方案 A 不需要编译环境以外的任何东西，风险更低。
+```bash
+cd kext && ./build.sh               # -> kext/AMDXHCIPreflight.kext
+cd ../gux && ./build_gux.sh <源码树> <输出目录>   # 不用 xcodebuild 编 GUX
+```
+
+`kext/build.sh` 用 `clang++ -mkernel -Xlinker -kext` 直接出 MH_KEXT_BUNDLE，`gux/build_gux.sh` 同样绕过 xcodebuild 逐文件编 26 个源文件。两者都做 ad-hoc 签名。
+
+> 已在 macOS 26.7.3 + Apple clang 21.0.0 + Command Line Tools 上实测跑通：单测 7/7 PASS，两个 kext 都是 `MH_KEXT_BUNDLE x86_64`，`plutil -lint` 通过。产物在 `out/`。
+> 若你有完整 Xcode，`build-all.sh` 会自动改用 `xcodebuild -configuration "El Capitan"`（fork 自带的工程），结果等价。
 
 ### 安装（OpenCore）
 
@@ -191,11 +261,44 @@ python3 gux/gen_patch.py /path/to/GUX-RyzenXHCIFix
 
 ## 5. 验证
 
+### 已经在真机上验过的（macOS 26.7.3 / Apple clang 21 / 只有 CLT）
+
+| 项目 | 结果 |
+|---|---|
+| `core/build_and_test.sh` | 7/7 PASS（g++、clang++ × c++98/11/17 + asan/ubsan，100 checks） |
+| `kext/syntax-check/check.sh` | c++11 / c++14 / c++17 全 PASS |
+| `./build-all.sh`（无 Xcode） | 两个 kext 都产出 `MH_KEXT_BUNDLE x86_64`，`plutil -lint` OK，adhoc 签名成功 |
+| `AMDXHCIPreflight.kext` 的内核集合构建 | 依赖解析 + 符号绑定全部通过；剩下的只是 UAKEL「未批准加载」策略拦截 |
+| 入口点符号（`nm -m`） | `_kmod_info` @ `__DATA` 0x4998、`__realmain` @ `__DATA` 0x4990，都是**已定义**（不是 U），`_pf_realmain` 在 `__TEXT` 0x3450 |
+| 构造器接线（`otool -v -s __DATA __mod_init_func`） | section 里**恰好一个**指针 `0x33f0` → `__GLOBAL__sub_I_AMDXHCIPreflight.cpp`，即类注册的静态构造函数；`pf_realmain` 就是遍历这一段把它跑起来的 |
+| 类符号（`nm -m`） | `__ZN23com_yg_AMDXHCIPreflight10gMetaClassE`、`…9metaClassE`、`__ZTV…`（vtable）、`…5probeE…`、`…5startE…` 全部已定义 |
+| `GenericUSBXHCI.kext`（打完补丁） | 构建成功，但**加载失败**：`Cannot find symbol for metaclass ... 'IOUSBControllerIsochListElement::gMetaClass'` —— 见第 0.2 节，这条路在 Tahoe 上封死 |
+
+### 一个还没验的点：加载时构造器是否真的被调用
+
+静态接线已经验完（上表最后三行）：入口点符号存在、`__mod_init_func` 恰好指向 `__GLOBAL__sub_I_AMDXHCIPreflight.cpp`、我们自己的 `gMetaClass` / vtable 都已定义。剩下唯一没验的是**动态那一步**——内核集合构建器会不会在加载时通过 `__realmain` 调它——而这只能在被 UAKEL 放行之后才看得到。
+
+判断方法（装上后一眼就能看出）：
+
+```bash
+# 1) kext 加载了没
+kmutil showloaded --list-only | grep -i amdxhci
+
+# 2) 类注册了没（关键）
+ioreg -c com_yg_AMDXHCIPreflight -l | head
+
+# 3) 控制器上有没有出现我们的属性（说明 start() 真的被调用了）
+ioreg -rc IOPCIDevice -l | grep -A1 amdxhci-preflight
+```
+
+第 2 条没有输出 = 类没注册，personality 匹配不会发生，preflight 不会跑。静态检查已经确认入口点和构造器接线都是对的，所以真出现这种情况，先怀疑**加载时机**（比如 kext 没进 kernelcache、被别的候选者抢先），再怀疑链接。第 3 条有 `amdxhci-preflight` 那行字符串，就说明整条链路（匹配 → start → preflight → 交棒）都通了。
+
+
 **编译前**先跑核心逻辑的宿主侧单测（Windows/Linux 都行，用 WSL 的 g++ 或 clang++）：
 
 ```bash
 cd core
-bash build_and_test.sh     # g++/clang++ × c++98/11/17 + asan/ubsan，当前 82 checks / 0 failures
+bash build_and_test.sh     # g++/clang++ × c++98/11/17 + asan/ubsan，当前 100 checks / 0 failures
 ```
 
 kext 源码不用 Mac 也能类型检查（用 `kext/syntax-check/stub/` 里那套假 IOKit 头）：
@@ -212,7 +315,7 @@ cd GUX-RyzenXHCIFix
 git apply --check /path/to/amdxhci-preflight/gux/GUX-Preflight.patch   # 无输出 = 可应用
 ```
 
-这个测试用一台模拟的 AMD xHC 跑了 15 个场景：健康、幻影控制器（全 1 / 全 0）、BAR 过小、无 LEGSUP、BIOS 不肯放手、reset 永不完成、reset 慢、CNR 慢、CNR 永不清、强制 RxDetect、全开关关闭、32 端口、halt+reset 双卡死。最后两个专门验证**卡死时也绝不写 ring 寄存器**。
+这个测试用一台模拟的 AMD xHC 跑了 18 个场景：健康、幻影控制器（全 1 / 全 0）、BAR 过小、无 LEGSUP、BIOS 不肯放手、reset 永不完成、reset 慢、CNR 慢、CNR 永不清、强制 RxDetect、全开关关闭、干跑（全开也只读）、32 端口、halt+reset 双卡死、FLR 成功/不支持/永不完成。最后几项专门验证**卡死时也绝不写 ring 寄存器**、**干跑时一个字节都不写**。模拟器里的 LEGSUP 是按其真实布局摆的：`cap+0` 同时装 capId=1 和 `BIOS_OWNED`，`cap+4` 是 `USBLEGCTLSTS`——偏移写错会立刻在第 3 步行权断言上炸出来。
 
 **开机后**：
 
@@ -274,6 +377,11 @@ kmutil showloaded --list-only | grep -i amdxhci
 | `-amdxhci_noports` | 不碰端口寄存器 |
 | `-amdxhci_nomsi` | 不动 MSI/MSI-X |
 | `-amdxhci_rxdetect_all` | 所有端口一律强制回 RxDetect（有些 AMD 板子必须这样） |
+| `-amdxhci_dryrun` | 只分类、只报告，零 MMIO 写、零 PCI 配置写 |
+| `-amdxhci_anyvendor` | 允许在非 `0x1022` 控制器上匹配；只配合 dryrun 用来验链路 |
+| `-amdxhci_flr` | 先做 PCIe Function Level Reset（把整个 function 打回热复位状态） |
+| `-amdxhci_noflr` | 明确不做 FLR（默认就是不做） |
+| `amdxhci_flr_ms=N` | 等 FLR 完成的超时，默认 200 |
 | `amdxhci_cnr_ms=N` | CNR 等待上限，默认 1200 |
 | `amdxhci_reset_ms=N` | HCRST 等待上限，默认 1000 |
 | `amdxhci_handoff_ms=N` | 交权等待上限，默认 1000 |
@@ -281,6 +389,10 @@ kmutil showloaded --list-only | grep -i amdxhci
 | `amdxhci_log=N` | 1 只打一行结果，2 打每一步，0 静默 |
 
 排查方法：一次只加一个 `-amdxhci_no*`，看 `amdxhci-preflight` 那一行的哪个字段变了。
+
+`-amdxhci_dryrun` + `-amdxhci_anyvendor` 是「先证明链路、再动硬件」用的：`Run()` 自己在内部把所有写路径关掉（不是靠调用方自觉），所以报告里只有分类结果、`flags` 带 `dry` 位、控制器上一个字节都没被写过。这两个参数让 kext 在任何一台 Intel 机上也能跑一遍，从而在把它放到 AMD 机之前就确认「入口点 → `OSMetaClass` 注册 → personality 匹配 → `start()` → 报告」全是通的。
+
+**`-amdxhci_flr` 是留给「默认参数仍然偶尔卡」那台机器的下一张牌**，默认关闭。`HCRST` 只复位 xHCI 核，不复位这个 PCI function 自己持有的东西（DMA 绑定、MSI 表、端口供电状态）；FLR 是唯一能把整个 function 打回热复位状态的复位，也是别的步骤都不会做的那一步。不开它是因为少数固件会「声称支持 FLR，然后真按下去就再也回不来」——没有那台机器可测的情况下不该默认按这个按钮。开启后报告里多一段 `flr=ok` / `flr=fail`，属性里是 `"amdxhci-flr" = "ok" | "timeout" | "not-supported" | "disabled"`。
 
 ---
 
@@ -298,12 +410,14 @@ kmutil showloaded --list-only | grep -i amdxhci
 
 ```
 amdxhci-preflight/
+├── build-all.sh                # 一键：单测 + 两个 kext（CLT 即可，不需要 Xcode.app）
 ├── core/
 │   ├── AMDXHCIPreflight.h      # header-only 状态归一器（无 IOKit 依赖）
 │   ├── test_amdxhci.cpp        # 模拟 AMD xHC 的单测，82 checks
 │   └── build_and_test.sh       # 6 组编译 + asan/ubsan
 ├── gux/
 │   ├── GUX-Preflight.patch     # 方案 A：打到 GUX-RyzenXHCIFix
+│   ├── build_gux.sh            # 无 xcodebuild 编 GUX（模板展开 / CRLF / kmod 入口）
 │   └── gen_patch.py            # 同一件事的生成器（幂等、严格锚点）
 ├── kext/
 │   ├── AMDXHCIPreflight.cpp    # 方案 B：IOService 子类，随时让位
@@ -312,5 +426,9 @@ amdxhci-preflight/
 │   └── syntax-check/           # 非 macOS 环境下的类型检查（假 IOKit 头）
 │       ├── check.sh
 │       └── stub/
+├── out/                        # 26.7.3 上真实构建出来的产物
+│   ├── AMDXHCIPreflight.kext
+│   ├── GenericUSBXHCI.kext
+│   └── build-report.txt
 └── README.md
 ```

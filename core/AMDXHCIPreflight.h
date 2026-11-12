@@ -61,7 +61,8 @@ enum
 	kPciCapPtr	= 0x34,
 	kPciCapMsi	= 0x05,
 	kPciCapMsix	= 0x11,
-	kPciCapPm	= 0x01
+	kPciCapPm	= 0x01,
+	kPciCapPcie	= 0x10
 };
 
 /* USBCMD / USBSTS bits */
@@ -131,12 +132,13 @@ enum
 	kLegSupBiosOwned	= 0x00010000u,
 	kLegSupOsOwned		= 0x01000000u,
 	/*
-	 * USBLEGCTLSTS: every SMI enable lives in 0..4, 5..12 and 17..19; the
-	 * three status bits at 29..31 are write-1-to-clear. Clearing the whole
-	 * enable span is the only formulation that is correct no matter which
-	 * of the vendor layouts a given firmware implements.
+	 * USBLEGCTLSTS write recipe, the same one Linux uses in
+	 * pci-quirks.c: keep the read-only fields (bits 1..3, 5..12, 17..19)
+	 * exactly as the firmware left them, drop everything else -- bit 0 is
+	 * the top level SMI enable, so writing it as 0 silences the SMI -- and
+	 * write 1 to the three write-to-clear status bits at 29..31.
 	 */
-	kLegCtlSmiEnableBits	= 0x000E1FFFu,
+	kLegCtlPreserve		= 0x000E1FEEu,
 	kLegCtlSmiEvents	= 0xE0000000u
 };
 
@@ -159,7 +161,11 @@ enum
 	kFlagPortsCleared	= 1u << 11,
 	kFlagRxDetectForced	= 1u << 12,
 	kFlagMsiOff		= 1u << 13,
-	kFlagSkew		= 1u << 14	/* port loop hit a register fault */
+	kFlagSkew		= 1u << 14,	/* port loop hit a register fault */
+	kFlagDryRun		= 1u << 15,	/* classify only: zero writes by design */
+	kFlagFlrOk		= 1u << 16,	/* PCIe function level reset completed */
+	kFlagFlrSkipped		= 1u << 17,	/* no PCIe capability, or no FLR support */
+	kFlagFlrTimeout		= 1u << 18	/* FLR never reported completion */
 };
 
 enum
@@ -200,11 +206,14 @@ struct Options
 	bool		ports;			/* clear port change bits / unstick PLS */
 	bool		msi;			/* disable MSI and MSI-X enables */
 	bool		rxdetect_all;		/* force RxDetect on every port, not only stuck ones */
+	bool		dryrun;			/* classify only: no MMIO write, no PCI-config write */
+	bool		flr;			/* PCIe function level reset before anything else */
 	uint32_t	cnr_ms;			/* wait for CNR to drain, per attempt */
 	uint32_t	halt_ms;		/* wait for HCH after clearing RS */
 	uint32_t	reset_ms;		/* wait for HCRST to self-clear, per attempt */
 	uint32_t	handoff_ms;		/* wait for BIOS_OWNED to clear */
 	uint32_t	reset_retries;		/* total HCRST attempts, >= 1 */
+	uint32_t	flr_ms;			/* wait for FLR to report completion */
 	uint32_t	max_total_ms;		/* hard ceiling for the whole preflight */
 	int		log_level;		/* 0 silent, 1 one line, 2 verbose */
 };
@@ -230,6 +239,7 @@ struct Report
 	uint32_t	wait_halt_ms;
 	uint32_t	wait_reset_ms;
 	uint32_t	wait_handoff_ms;
+	uint32_t	wait_flr_ms;
 	uint32_t	total_ms;
 	uint32_t	rxdetect_mask_lo;	/* ports 0..31 */
 	uint32_t	rxdetect_mask_hi;	/* ports 32..63 */
@@ -329,11 +339,14 @@ static inline void Defaults(Options* o)
 	o->ports	= true;
 	o->msi		= true;
 	o->rxdetect_all	= false;
+	o->dryrun	= false;
+	o->flr		= false;
 	o->cnr_ms	= 1200u;
 	o->halt_ms	= 250u;
 	o->reset_ms	= 1000u;
 	o->handoff_ms	= 1000u;
 	o->reset_retries = 2u;
+	o->flr_ms	= 200u;
 	o->max_total_ms	= 5000u;
 	o->log_level	= 1;
 }
@@ -509,27 +522,35 @@ static inline void do_handoff(const Io& io, const Options& opt, Report* r)
 		return;
 	}
 	bool f = false;
-	/* USBLEGCTLSTS lives at cap + 8: mask every SMI enable, ack W1C events. */
-	uint32_t ctl = rd32(io, off + 8u, &f);
+	/*
+	 * USBLEGSUP (BIOS_OWNED / OS_OWNED) *is* the first dword of the legacy
+	 * capability structure: capId/next/capSpecific share it with the two
+	 * semaphore bits. USBLEGCTLSTS is the second dword. Both offsets are
+	 * relative to the structure, i.e. cap+0 and cap+4 -- Linux spells this
+	 * XHCI_LEGACY_SUPPORT_OFFSET 0x00 / XHCI_LEGACY_CONTROL_OFFSET 0x04.
+	 */
+#define kLegSupRelOff	0u
+#define kLegCtlRelOff	4u
+	/* Mask every SMI enable first, so the firmware cannot re-arm itself. */
+	uint32_t ctl = rd32(io, off + kLegCtlRelOff, &f);
 	if (f) {
 		r->flags |= kFlagHandoffTimeout;
 		return;
 	}
-	wr32(io, off + 8u, (ctl & ~kLegCtlSmiEnableBits) | kLegCtlSmiEvents);
+	wr32(io, off + kLegCtlRelOff, (ctl & kLegCtlPreserve) | kLegCtlSmiEvents);
 
-	/* USBLEGSUP lives at cap + 4. */
-	uint32_t sup = rd32(io, off + 4u, &f);
+	uint32_t sup = rd32(io, off + kLegSupRelOff, &f);
 	if (f) {
 		r->flags |= kFlagHandoffTimeout;
 		return;
 	}
 	if (!(sup & kLegSupBiosOwned)) {
 		if (!(sup & kLegSupOsOwned))
-			wr32(io, off + 4u, sup | kLegSupOsOwned);
+			wr32(io, off + kLegSupRelOff, sup | kLegSupOsOwned);
 		return;
 	}
-	wr32(io, off + 4u, sup | kLegSupOsOwned);
-	uint32_t waited = wait_reg(io, off + 4u, kLegSupBiosOwned, 0u,
+	wr32(io, off + kLegSupRelOff, sup | kLegSupOsOwned);
+	uint32_t waited = wait_reg(io, off + kLegSupRelOff, kLegSupBiosOwned, 0u,
 				  opt.handoff_ms, &f);
 	r->wait_handoff_ms = (waited == kWaitTimeout) ? opt.handoff_ms : waited;
 	if (f) {
@@ -543,8 +564,10 @@ static inline void do_handoff(const Io& io, const Options& opt, Report* r)
 		 * so nothing can raise it again.
 		 */
 		r->flags |= kFlagHandoffForced;
-		wr32(io, off + 4u, (sup | kLegSupOsOwned) & ~kLegSupBiosOwned);
+		wr32(io, off + kLegSupRelOff, (sup | kLegSupOsOwned) & ~kLegSupBiosOwned);
 	}
+#undef kLegSupRelOff
+#undef kLegCtlRelOff
 }
 
 /* ------------------------------------------------------------------------- */
@@ -684,6 +707,65 @@ static inline void do_ports(const Io& io, const Options& opt, Report* r)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Stage 7b: PCIe function level reset                                       */
+/*                                                                           */
+/* HCRST resets the xHCI core, but it does not touch everything the PCI      */
+/* function owns: firmware may have left DMA bindings, MSI table state or    */
+/* the port power state in a shape that survives a core reset. FLR is the    */
+/* only reset that puts the whole function back to its post-hot-reset state, */
+/* and on the AMD boards that hang it is the step nothing else performs.     */
+/* It is off by default because a few firmware implementations advertise the */
+/* capability and then wedge when it is used - enable it with -amdxhci_flr.  */
+/* ------------------------------------------------------------------------- */
+static inline void do_flr(const Io& io, const Options& opt, Report* r)
+{
+	uint8_t cap = (uint8_t)(io.cfg_read8(io.ctx, kPciCapPtr) & 0xFCu);
+
+	for (int guard = 0; guard < 48 && cap >= 0x40u; ++guard) {
+		uint8_t id   = io.cfg_read8(io.ctx, cap);
+		uint8_t next = (uint8_t)(io.cfg_read8(io.ctx, (uint8_t)(cap + 1u)) & 0xFCu);
+
+		if (id == kPciCapPcie) {
+			uint8_t dcap = (uint8_t)(cap + 4u);	/* Device Capabilities */
+			uint8_t dctl = (uint8_t)(cap + 8u);	/* Device Control */
+
+			uint32_t caps = (uint32_t)io.cfg_read16(io.ctx, dcap) |
+					((uint32_t)io.cfg_read16(io.ctx,
+						(uint8_t)(dcap + 2u)) << 16);
+			if (!(caps & (1u << 28))) {		/* no FLR */
+				r->flags |= kFlagFlrSkipped;
+				return;
+			}
+
+			uint16_t ctl = io.cfg_read16(io.ctx, dctl);
+			io.cfg_write16(io.ctx, dctl, (uint16_t)(ctl | (1u << 15)));
+
+			/* FLR must complete within 100 ms; poll a little longer. */
+			uint32_t waited = 0;
+			for (;;) {
+				uint16_t v = io.cfg_read16(io.ctx, dctl);
+				if (!(v & (1u << 15))) {
+					r->flags |= kFlagFlrOk;
+					r->wait_flr_ms = waited;
+					return;
+				}
+				if (waited >= opt.flr_ms)
+					break;
+				io.sleep_ms(io.ctx, 10);
+				waited += 10;
+			}
+			r->wait_flr_ms = waited;
+			r->flags |= kFlagFlrTimeout;
+			return;
+		}
+		if (!next || next == cap)
+			break;
+		cap = next;
+	}
+	r->flags |= kFlagFlrSkipped;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Stage 8: PCI level interrupt deconfiguration                              */
 /* ------------------------------------------------------------------------- */
 static inline void do_msi(const Io& io, Report* r)
@@ -736,6 +818,8 @@ static inline void build_line(Report* r)
 	out_kvs(o, "ho", (r->flags & kFlagHandoffForced) ? "forced" :
 			(r->flags & kFlagHandoffTimeout) ? "fail" :
 			(r->flags & kFlagLegacyMissing) ? "none" : "ok");
+	if (r->flags & (kFlagFlrOk | kFlagFlrTimeout))
+		out_kvs(o, "flr", (r->flags & kFlagFlrTimeout) ? "fail" : "ok");
 	out_kvs(o, "rst", (r->flags & kFlagResetOk) ? "ok" : "fail");
 	if (r->flags & kFlagResetOk) {
 		out_char(o, '/');
@@ -774,6 +858,18 @@ static inline Report Run(const Io& io, const Options& opt)
 	r.flags &= ~kFlagBailSafe;
 	r.status = kStatusOk;
 
+	/*
+	 * A dry run is a classification pass: it must not write one register even
+	 * if the caller left the individual switches on. This is what makes the
+	 * kext safe to load on a machine whose controller is fine, purely to prove
+	 * that the match/start/report plumbing works.
+	 */
+	if (opt.dryrun)
+		r.flags |= kFlagDryRun;
+
+	if (opt.flr && !opt.dryrun)
+		do_flr(io, opt, &r);
+
 	{
 		uint32_t op = r.cap_length;
 		bool f = false;
@@ -784,7 +880,7 @@ static inline Report Run(const Io& io, const Options& opt)
 		}
 
 		/* CNR must be clear before anything can be programmed. */
-		if (r.sts_before & kStsNotReady) {
+		if ((r.sts_before & kStsNotReady) && !opt.dryrun) {
 			uint32_t w = wait_reg(io, op + kOpUsbSts, kStsNotReady, 0u,
 					      opt.cnr_ms, &f);
 			r.wait_cnr_ms = (w == kWaitTimeout) ? opt.cnr_ms : w;
@@ -797,20 +893,20 @@ static inline Report Run(const Io& io, const Options& opt)
 		}
 	}
 
-	if (opt.handoff)
+	if (opt.handoff && !opt.dryrun)
 		do_handoff(io, opt, &r);
 
-	if (opt.reset) {
+	if (opt.reset && !opt.dryrun) {
 		do_halt(io, opt, &r);
 		do_reset(io, opt, &r);
 	}
 
 	do_zero_rings(io, &r);
 
-	if (opt.ports)
+	if (opt.ports && !opt.dryrun)
 		do_ports(io, opt, &r);
 
-	if (opt.msi)
+	if (opt.msi && !opt.dryrun)
 		do_msi(io, &r);
 
 done:
@@ -822,7 +918,7 @@ done:
 	}
 
 	if (r.flags & (kFlagCnrTimeout | kFlagResetTimeout | kFlagHandoffTimeout |
-		       kFlagRegFault | kFlagSkew))
+		       kFlagRegFault | kFlagSkew | kFlagFlrTimeout))
 		r.status = kStatusWarn;
 	else
 		r.status = kStatusOk;

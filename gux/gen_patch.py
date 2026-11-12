@@ -132,6 +132,16 @@ static void amdxhci_pf_options(amdxhci::Options* opt)
 		opt->msi = false;
 	if (PE_parse_boot_argn("-amdxhci_rxdetect_all", &v, sizeof v))
 		opt->rxdetect_all = true;
+	if (PE_parse_boot_argn("-amdxhci_dryrun", &v, sizeof v)) {
+		opt->dryrun = true;
+		opt->handoff = opt->reset = opt->ports = opt->msi = false;
+	}
+	if (PE_parse_boot_argn("-amdxhci_flr", &v, sizeof v))
+		opt->flr = true;
+	if (PE_parse_boot_argn("-amdxhci_noflr", &v, sizeof v))
+		opt->flr = false;
+	if (PE_parse_boot_argn("amdxhci_flr_ms", &v, sizeof v) && v)
+		opt->flr_ms = v;
 	if (PE_parse_boot_argn("amdxhci_cnr_ms", &v, sizeof v) && v)
 		opt->cnr_ms = v;
 	if (PE_parse_boot_argn("amdxhci_reset_ms", &v, sizeof v) && v)
@@ -272,7 +282,19 @@ OLD_HACK_RE = re.compile(
 
 INCLUDE_ANCHOR = '#include <IOKit/IOFilterInterruptEventSource.h>\n'
 INCLUDE_NEW = ('#include <IOKit/IOFilterInterruptEventSource.h>\n'
-               '#include <pexpert/pexpert/boot.h>\n'
+               '\n'
+               '/* boot-arg parsing moved between SDK releases; both spellings\n'
+               ' * and no pexpert prototypes at all (CLT) all happen. */\n'
+               '#if defined(__has_include)\n'
+               '#  if __has_include(<pexpert/pexpert/boot.h>)\n'
+               '#    include <pexpert/pexpert/boot.h>\n'
+               '#  elif __has_include(<pexpert/boot.h>)\n'
+               '#    include <pexpert/boot.h>\n'
+               '#  endif\n'
+               '#endif\n'
+               'extern "C" int PE_parse_boot_argn(const char * arg_string,\n'
+               '\t\t\t\t  void * arg_ptr, int max_arg_size);\n'
+               '\n'
                '#include "AMDXHCIPreflight.h"\n')
 
 PRAGMA_ANCHOR = '#pragma mark -\n#pragma mark IOUSBController Pure\n#pragma mark -\n'

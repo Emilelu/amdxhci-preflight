@@ -84,6 +84,10 @@ struct Mock
 	uint32_t	legs_sup;
 	uint32_t	legs_ctl;
 
+	bool		flr_cap;		// Device Capabilities advertises FLR
+	bool		flr_never_completes;	// FLR bit never clears
+	uint32_t	flr_count;		// FLRs actually triggered
+
 	Mock(Kind k = kHealthy, uint8_t nports = 8)
 	{
 		kind = k;
@@ -108,6 +112,9 @@ struct Mock
 		bios_never_releases = false;
 		legs_sup = kLegSupBiosOwned;
 		legs_ctl = 0xE0003FFFu;		// every SMI enable set, all events pending
+		flr_cap = true;
+		flr_never_completes = false;
+		flr_count = 0;
 		setup();
 	}
 
@@ -123,11 +130,12 @@ struct Mock
 		r32(0x10) = (0x40u << 16) | 0x00000001u;	// XECP -> dword 0x40 (byte 0x100)
 
 		// SuperSpeed protocol cap at 0x100, legacy cap at 0x110.
+		// The legacy cap packs capId/next and BIOS_OWNED/OS_OWNED into the
+		// same first dword; USBLEGCTLSTS is the second one.
 		if (kind != kNoLegacyCap) {
 			r32(0x100) = 0x00000402u;	// id 2, next 0x04
-			r32(0x110) = 0x00000001u;	// id 1, next 0
-			r32(0x114) = legs_sup;
-			r32(0x118) = legs_ctl;
+			r32(0x110) = 0x00000001u | legs_sup;	// id 1, next 0, semaphores
+			r32(0x114) = legs_ctl;
 		} else {
 			r32(0x100) = 0x00000009u;	// id 9, next 0
 		}
@@ -173,8 +181,14 @@ struct Mock
 		cfg[0x42] = 0x03;					// PMCSR: D3
 		cfg[0x50] = 0x05; cfg[0x51] = 0x60;		// MSI  -> 0x60
 		cfg[0x52] = 0x01;					// MSI enable set
-		cfg[0x60] = 0x11; cfg[0x61] = 0x00;		// MSI-X -> end
+		cfg[0x60] = 0x11; cfg[0x61] = 0x70;		// MSI-X -> PCIe
 		cfg[0x62] = 0x00; cfg[0x63] = 0x80;		// MSI-X enable set
+
+		// PCIe capability at 0x70: Device Capabilities bit 28 = FLR capable,
+		// Device Control bit 15 = initiate FLR.
+		cfg[0x70] = 0x10; cfg[0x71] = 0x00;
+		cfg[0x77] = flr_cap ? 0x10 : 0x00;	// bit 28 lives in the upper word
+		cfg[0x78] = 0x00; cfg[0x79] = 0x00;
 	}
 
 	// -- MMIO -------------------------------------------------------------
@@ -238,16 +252,17 @@ struct Mock
 			r32(0x44) &= ~(v & (kStsHsErr | kStsEventInt | kStsPortChange | kStsSaveRestErr));
 			return;
 		}
-		if (off == 0x114) {			// USBLEGSUP
+		if (off == 0x110) {			// USBLEGSUP (cap dword 0)
 			if ((v & kLegSupOsOwned) && !bios_never_releases)
 				v &= ~kLegSupBiosOwned;
+			v |= 0x00000001u;		// capId stays 1
 			legs_sup = v;
-			r32(0x114) = v;
+			r32(0x110) = v;
 			return;
 		}
-		if (off == 0x118) {
+		if (off == 0x114) {			// USBLEGCTLSTS (cap dword 1)
 			legs_ctl = v;
-			r32(0x118) = v;
+			r32(0x114) = v;
 			return;
 		}
 		if (off >= 0x440 && off < 0x440 + (uint32_t)ports * 0x10) {
@@ -280,6 +295,15 @@ struct Mock
 	void cfg_write16(uint8_t off, uint16_t v)
 	{
 		++cfg_writes;
+
+		// PCIe Device Control: an FLR write completes (bit self-clears) unless
+		// this mock is configured to simulate firmware that never finishes.
+		if (off == 0x78u && (v & 0x8000u)) {
+			++flr_count;
+			if (!flr_never_completes)
+				v = (uint16_t)(v & ~0x8000u);
+		}
+
 		cfg[off] = (uint8_t)(v & 0xFFu);
 		cfg[(uint8_t)(off + 1)] = (uint8_t)(v >> 8);
 	}
@@ -379,7 +403,8 @@ int main()
 		check_eq("healthy", "usbsts change bits", (long)(m.r32(0x44) & (kStsHsErr | kStsEventInt | kStsPortChange)), 0);
 		check_eq("healthy", "legs bios owned", (long)(m.legs_sup & kLegSupBiosOwned), 0);
 		check_eq("healthy", "legs os owned", (long)(m.legs_sup & kLegSupOsOwned), kLegSupOsOwned);
-		check_eq("healthy", "legs smi enables", (long)(m.legs_ctl & kLegCtlSmiEnableBits), 0);
+		check_eq("healthy", "legs smi master off", (long)(m.legs_ctl & 1u), 0);
+		check_eq("healthy", "legs smi ro preserved", (long)(m.legs_ctl & kLegCtlPreserve), 0x00001FEE);
 		check_eq("healthy", "legs smi events acked", (long)(m.legs_ctl & kLegCtlSmiEvents), kLegCtlSmiEvents);
 		check_eq("healthy", "msi enable", (long)(m.cfg_read16(0x52) & 1), 0);
 		check_eq("healthy", "msix enable", (long)(m.cfg_read16(0x62) & 0x8000), 0);
@@ -451,7 +476,7 @@ int main()
 		check("sticky", "no handoff timeout", (r.flags & kFlagHandoffTimeout) == 0);
 		check_eq("sticky", "bios owned cleared", (long)(m.legs_sup & kLegSupBiosOwned), 0);
 		check_eq("sticky", "os owned set", (long)(m.legs_sup & kLegSupOsOwned), kLegSupOsOwned);
-		check_eq("sticky", "smi masked", (long)(m.legs_ctl & kLegCtlSmiEnableBits), 0);
+		check_eq("sticky", "smi master off", (long)(m.legs_ctl & 1u), 0);
 		check_eq("sticky", "status", r.status, kStatusOk);
 		check("sticky", "waited about handoff_ms", r.wait_handoff_ms >= 900 && r.wait_handoff_ms <= 1100);
 	}
@@ -530,6 +555,61 @@ int main()
 		check("off", "no reset", (r.flags & kFlagResetOk) == 0);
 		check("off", "still classified", r.num_ports == 8);
 		check_eq("off", "biossup untouched", (long)(m.legs_sup & kLegSupBiosOwned), kLegSupBiosOwned);
+	}
+
+	// 12b. dry run: every switch on, still zero writes ----------------------
+	{
+		banner("dry run");
+		Mock m(Mock::kHealthy, 8);
+		Options o = fast_opts();
+		o.dryrun = true;	/* handoff/reset/ports/msi stay on */
+		Report r = Run(m.io(), o);
+		check("dry", "dryrun flag", (r.flags & kFlagDryRun) != 0);
+		check_eq("dry", "no mmio writes", (long)m.mmio_writes, 0);
+		check_eq("dry", "no cfg writes", (long)m.cfg_writes, 0);
+		check("dry", "still classified", r.num_ports == 8);
+		check("dry", "no reset claimed", (r.flags & kFlagResetOk) == 0);
+		check("dry", "no msi claimed", (r.flags & kFlagMsiOff) == 0);
+		check_eq("dry", "biossup untouched", (long)(m.legs_sup & kLegSupBiosOwned),
+			 kLegSupBiosOwned);
+	}
+
+	// 12c. PCIe function level reset ---------------------------------------
+	{
+		banner("flr ok");
+		Mock m(Mock::kHealthy, 8);
+		Options o = fast_opts();
+		o.flr = true;
+		Report r = Run(m.io(), o);
+		check("flr", "flr ok flag", (r.flags & kFlagFlrOk) != 0);
+		check_eq("flr", "triggered once", (long)m.flr_count, 1);
+		check("flr", "line mentions flr", std::strstr(r.line, "flr=ok") != 0);
+		check("flr", "status ok", r.status == kStatusOk);
+	}
+
+	{
+		banner("flr unsupported");
+		Mock m(Mock::kHealthy, 8);
+		m.cfg[0x77] = 0x00;			// Device Capabilities without bit 28
+		Options o = fast_opts();
+		o.flr = true;
+		Report r = Run(m.io(), o);
+		check("flr-no", "skipped flag", (r.flags & kFlagFlrSkipped) != 0);
+		check_eq("flr-no", "never triggered", (long)m.flr_count, 0);
+	}
+
+	{
+		banner("flr never completes");
+		Mock m(Mock::kHealthy, 8);
+		m.flr_never_completes = true;
+		Options o = fast_opts();
+		o.flr = true;
+		o.flr_ms = 60;
+		Report r = Run(m.io(), o);
+		check("flr-to", "timeout flag", (r.flags & kFlagFlrTimeout) != 0);
+		check("flr-to", "bounded wait", r.wait_flr_ms <= 60);
+		check("flr-to", "status warn", r.status == kStatusWarn);
+		check("flr-to", "still went on to reset", (r.flags & kFlagResetOk) != 0);
 	}
 
 	// 13. report line is always terminated ---------------------------------

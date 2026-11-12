@@ -1,0 +1,13 @@
+* text=auto
+
+# These run on macOS/Linux; a CRLF checkout would break them.
+*.sh      text eol=lf
+*.py      text eol=lf
+*.cpp     text eol=lf
+*.h       text eol=lf
+*.md      text eol=lf
+*.plist   text eol=lf
+*.patch   text eol=lf
+
+# Compiled kernel extension shipped in the OpenCore package
+dist/Kexts/** binary

@@ -30,7 +30,18 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
-#include <pexpert/pexpert/boot.h>
+
+/* boot-arg parsing moved between SDK releases; both spellings and no header
+ * at all (CLT ships Kernel.framework without the pexpert prototypes) exist. */
+#if defined(__has_include)
+#  if __has_include(<pexpert/pexpert/boot.h>)
+#    include <pexpert/pexpert/boot.h>
+#  elif __has_include(<pexpert/boot.h>)
+#    include <pexpert/boot.h>
+#  endif
+#endif
+extern "C" int PE_parse_boot_argn(const char * arg_string, void * arg_ptr,
+				  int max_arg_size);
 
 #include "AMDXHCIPreflight.h"
 
@@ -52,6 +63,14 @@ static void pf_options(amdxhci::Options* opt)
 		opt->msi = false;
 	if (PE_parse_boot_argn("-amdxhci_rxdetect_all", &v, sizeof v))
 		opt->rxdetect_all = true;
+	if (PE_parse_boot_argn("-amdxhci_dryrun", &v, sizeof v))
+		opt->dryrun = true;
+	if (PE_parse_boot_argn("-amdxhci_flr", &v, sizeof v))
+		opt->flr = true;
+	if (PE_parse_boot_argn("-amdxhci_noflr", &v, sizeof v))
+		opt->flr = false;
+	if (PE_parse_boot_argn("amdxhci_flr_ms", &v, sizeof v) && v)
+		opt->flr_ms = v;
 	if (PE_parse_boot_argn("amdxhci_cnr_ms", &v, sizeof v) && v)
 		opt->cnr_ms = v;
 	if (PE_parse_boot_argn("amdxhci_reset_ms", &v, sizeof v) && v)
@@ -167,7 +186,7 @@ static void pf_pci_prepare(IOPCIDevice* device)
 }
 
 /* Run the preflight and publish the result. Returns false when skipped. */
-static bool pf_run(IOPCIDevice* device, const amdxhci::Options& opt)
+static bool pf_run(IOPCIDevice* device, amdxhci::Options opt)
 {
 	IOMemoryMap* map = device->mapDeviceMemoryWithIndex(0U);
 	amdxhci::Io io;
@@ -201,7 +220,15 @@ static bool pf_run(IOPCIDevice* device, const amdxhci::Options& opt)
 	io.device	= device->configRead16(kIOPCIConfigDeviceID);
 
 	device->setProperty("amdxhci-preflight-enabled", true);
-	pf_pci_prepare(device);
+	/*
+	 * A dry run classifies the controller and publishes the report without a
+	 * single MMIO or PCI-config write. That makes it safe on a machine whose
+	 * controller is not the problem (any Intel box, for instance), which is
+	 * how the whole chain - entry point, OSMetaClass registration, personality
+	 * match, start(), report - can be proven before it is deployed on AMD.
+	 */
+	if (!opt.dryrun)
+		pf_pci_prepare(device);
 	report = amdxhci::Run(io, opt);
 
 	device->setProperty("amdxhci-preflight", report.line);
@@ -212,6 +239,15 @@ static bool pf_run(IOPCIDevice* device, const amdxhci::Options& opt)
 	device->setProperty("amdxhci-reset-attempts",
 			    static_cast<unsigned long long>(report.reset_attempts), 32U);
 	device->setProperty("amdxhci-total-ms", static_cast<unsigned long long>(report.total_ms), 32U);
+	device->setProperty("amdxhci-bar-bytes", static_cast<unsigned long long>(report.bar_size), 32U);
+	device->setProperty("amdxhci-hci-version",
+			    static_cast<unsigned long long>(report.hci_version), 32U);
+	if (opt.dryrun)
+		device->setProperty("amdxhci-dryrun", true);
+	device->setProperty("amdxhci-flr",
+			    !opt.flr ? "disabled" :
+			    (report.flags & amdxhci::kFlagFlrOk) ? "ok" :
+			    (report.flags & amdxhci::kFlagFlrTimeout) ? "timeout" : "not-supported");
 	if (report.flags & amdxhci::kFlagPhantom)
 		device->setProperty("amdxhci-phantom", true);
 
@@ -235,6 +271,8 @@ IOService* com_yg_AMDXHCIPreflight::probe(IOService* provider, SInt32* score)
 {
 	IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
 	uint16_t vendor, devid;
+	uint32_t v;
+	bool any;
 
 	if (!device)
 		return 0;
@@ -242,11 +280,21 @@ IOService* com_yg_AMDXHCIPreflight::probe(IOService* provider, SInt32* score)
 	devid = device->configRead16(kIOPCIConfigDeviceID);
 
 	/*
+	 * -amdxhci_anyvendor exists only so the plumbing (entry point, class
+	 * registration, personality match, start, report) can be exercised on a
+	 * non-AMD machine in dry-run mode. Without -amdxhci_dryrun start() refuses
+	 * to touch a controller that is not AMD's, so this cannot misfire.
+	 */
+	any = PE_parse_boot_argn("-amdxhci_anyvendor", &v, sizeof v) != 0;
+
+	/*
 	 * Never probe a slot that does not answer, and touch no MMIO here: probe
 	 * runs before access to the device is serialised, so every hardware
 	 * access belongs in start().
 	 */
-	if (vendor != 0x1022U || devid == 0xFFFFU)
+	if (devid == 0xFFFFU)
+		return 0;
+	if (!any && vendor != 0x1022U)
 		return 0;
 
 	if (score)
@@ -264,6 +312,16 @@ bool com_yg_AMDXHCIPreflight::start(IOService* provider)
 		return false;
 
 	pf_options(&opt);
+
+	/*
+	 * -amdxhci_anyvendor lets probe() match elsewhere, but a real clean-up is
+	 * only ever run on an AMD controller. Dry run is the only exception, and it
+	 * writes nothing.
+	 */
+	if (device->configRead16(kIOPCIConfigVendorID) != 0x1022U && !opt.dryrun) {
+		device->setProperty("amdxhci-preflight", "skipped: not an AMD controller");
+		return false;
+	}
 
 	if (PE_parse_boot_argn("-amdxhci_off", &v, sizeof v))
 		device->setProperty("amdxhci-preflight", "disabled by boot-arg");

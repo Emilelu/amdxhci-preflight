@@ -17,7 +17,7 @@ typedef unsigned long long UInt64;
 
 extern "C" void IOLog(const char* fmt, ...);
 extern "C" void IOSleep(unsigned int ms);
-extern "C" bool PE_parse_boot_argn(const char* arg_string, void* arg_ptr, int max_arg_size);
+extern "C" int PE_parse_boot_argn(const char* arg_string, void* arg_ptr, int max_arg_size);
 
 class IOMemoryMap
 {
