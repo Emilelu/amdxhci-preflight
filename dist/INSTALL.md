@@ -28,15 +28,16 @@ EFI/OC/Kexts/AMDXHCIPreflight.kext
     <key>Enabled</key>           <true/>
     <key>ExecutablePath</key>    <string>Contents/MacOS/AMDXHCIPreflight</string>
     <key>MaxKernel</key>         <string></string>
-    <key>MinKernel</key>         <string>20.0.0</string>
+    <key>MinKernel</key>         <string>19.0.0</string>
     <key>PlistPath</key>         <string>Contents/Info.plist</string>
 </dict>
 ```
 
-`MinKernel 20.0.0` = **Big Sur 11 起**（20.x）。这个 kext 只依赖 `com.apple.kpi.*` 和 `com.apple.iokit.IOPCIFamily`，plist 里声明的是 `IOPCIFamily 2.6`（不是编译机上的 2.9），所以同一个二进制从 Big Sur 一直能加载到 Tahoe：
+`MinKernel 19.0.0` = **Catalina 10.15 起**（19.x）。这个 bug 是 AMD 平台特有的、与 macOS 版本无关（Catalina 上装不装原版 fork 都卡），所以兼容范围直接从 Catalina 划起。kext 只依赖 `com.apple.kpi.*` 和 `com.apple.iokit.IOPCIFamily`，plist 里声明的是 `IOPCIFamily 2.6`（不是编译机上的 2.9），同一个二进制从 Catalina 一直能加载到 Tahoe：
 
 | 系统 | `MinKernel` |
 |---|---|
+| Catalina 10.15 | `19.0.0` |
 | Big Sur 11 | `20.0.0` |
 | Monterey 12 | `21.0.0` |
 | Ventura 13 | `22.0.0` |
@@ -44,7 +45,7 @@ EFI/OC/Kexts/AMDXHCIPreflight.kext
 | Sequoia 15 | `24.0.0` |
 | Tahoe 26 | `25.0.0` |
 
-Catalina 10.15 及更早不在支持范围（`IOPCIFamily` 是 2.8 一代，且这些系统上本来没有这个开机卡住的问题）。`MaxKernel` 留空表示不设上限。
+Mojave 10.14 / High Sierra 10.13 没验过（要试就把 `MinKernel` 改成 `18.0.0` / `17.0.0`）。`MaxKernel` 留空表示不设上限。
 
 ## 3. 别同时装旧的 fork
 

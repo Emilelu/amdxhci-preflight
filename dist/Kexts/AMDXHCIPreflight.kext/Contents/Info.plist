@@ -51,7 +51,7 @@
 		     every API used here (configRead16 / configWrite16,
 		     mapDeviceMemoryWithIndex, findPCICapability) predates 10.9.
 		     Declaring the lower bound is what makes one binary load on
-		     Big Sur (11) through Tahoe (26) instead of only on the newest.
+		     Catalina (10.15) through Tahoe (26) instead of only on the newest.
 		-->
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>2.6</string>

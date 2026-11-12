@@ -1,6 +1,8 @@
 # AMD xHCI 开机卡住修复：把「碰运气」的退出改成确定性的交接
 
-针对 [RattletraPM/GUX-RyzenXHCIFix](https://github.com/RattletraPM/GUX-RyzenXHCIFix) 在 macOS Sonoma / Sequoia / Tahoe 上偶发开机卡住的问题（SSDT 禁用一个 XHCI 控制器就正常）。
+针对 [RattletraPM/GUX-RyzenXHCIFix](https://github.com/RattletraPM/GUX-RyzenXHCIFix) 那套「让 GUX 在早期 init 后故意失败退出」的做法。
+
+> **症状的版本范围比这个 fork 声称的宽得多**：Catalina 起就有，一直到现在。实测记录——Catalina 上**装不装这个 fork 都会卡**（只有 SSDT 禁用一个 XHCI 控制器才进得去），Big Sur 以上装 fork 是偶发卡。也就是说卡死的根源不在 macOS 版本，也不在这个 fork：是固件/BIOS 交接之后 xHC 留在了一个 Apple 驱动无法可靠复位干净的状态，fork 里那段「早期 init 后退出」只是**碰巧**动到了几个寄存器，所以时灵时不灵。
 
 ---
 
@@ -145,6 +147,17 @@ AMD 平台一般有两个 xHC（CPU 侧 + 芯片组侧），两个 `IOPCIDevice`
 
 ---
 
+### 1.1 为什么只有 AMD 会这样
+
+Intel 机器的 UEFI 在 `ExitBootServices` 前后会把 xHC 干净地交给 OS（`USBLEGSUP` 交接、SMI 关掉、端口回 RxDetect），Apple 驱动就是按这个前提写的 —— 它自己**不检查也不处理** `USBLEGSUP`。AMD 主板（尤其是 AM4/AM5 的 ASUS、Gigabyte）经常做不到：
+
+- `BIOS_OWNED` 留着、USB SMI 使能位留着 → 开机早期 SMI 风暴，控制器在 Apple 看来像「死了」
+- 端口被固件留在 `Polling` / `Compliance` / `U3`，`USBSTS.CNR` 不清 → Apple 的 HCRST 超时，卡在这一步
+- 寄存器里还残留上一位主人的 `CRCR` / `DCBAAP` 指向已经不属于 OS 的内存
+- 部分芯片组 xHC 没有可用 MSI，中断分配失败
+
+这四条正是 §2 表格里第 2–7 步逐条处理的，也是「不同 macOS 版本都卡、不同主板卡的表现还不一样」的原因 —— 卡的位置取决于固件留下了哪一种脏状态。
+
 ## 2. 修复方案：把退出前的动作补全
 
 `core/AMDXHCIPreflight.h` 是一个 header-only、不依赖 IOKit 的状态归一器。它在 fork 里替换掉那段假退出，在独立 kext 里作为 `start()` 的主体。
@@ -223,9 +236,9 @@ cd ../gux && ./build_gux.sh <源码树> <输出目录>   # 不用 xcodebuild 编
 </dict></array></dict>
 ```
 
-拷到 `EFI/OC/Kexts/AMDXHCIPreflight.kext`，`MinKernel` 填 `20.0.0`（Big Sur 起），`MaxKernel` 留空。
+拷到 `EFI/OC/Kexts/AMDXHCIPreflight.kext`，`MinKernel` 填 `19.0.0`（Catalina 起），`MaxKernel` 留空。
 
-> **兼容范围：Big Sur 11 → Tahoe 26，同一个 x86_64 二进制。** 代码只用 `IOService` / `IOPCIDevice` / `IOMemoryMap` / `IOLog` / `IOSleep` 和自己定义的一套 xHCI 寄存器常量，不继承任何 USB 类，因此不随 USB 栈改版错位。版本门槛全在 plist 里：`com.apple.kpi.*` 声明 `12.0.0`（10.9 起就没变过），`com.apple.iokit.IOPCIFamily` 声明 **`2.6`** 而不是编译机上的 `2.9` —— 加载器要求「库的 compatible 版 ≤ 声明值 ≤ 库的 CFBundleVersion」，取低界才能一个二进制通吃。Catalina 10.15 及更早不支持（`IOPCIFamily` 还是 2.8 一代，且那些系统本来没有这个开机卡住的问题）。
+> **兼容范围：Catalina 10.15 → Tahoe 26，同一个 x86_64 二进制。** 这个 bug 是 AMD 平台特有的（Intel 机型不出现），且与 macOS 版本无关 —— Catalina 上装不装原版 fork 都卡，所以没有理由把它限制在 Sonoma 之上。代码只用 `IOService` / `IOPCIDevice` / `IOMemoryMap` / `IOLog` / `IOSleep` 和自己定义的一套 xHCI 寄存器常量，不继承任何 USB 类，因此不随 USB 栈改版错位。版本门槛全在 plist 里：`com.apple.kpi.*` 声明 `12.0.0`（10.9 起就没变过），`com.apple.iokit.IOPCIFamily` 声明 **`2.6`** 而不是编译机上的 `2.9` —— 加载器要求「库的 compatible 版 ≤ 声明值 ≤ 库的 CFBundleVersion」，取低界才能一个二进制通吃（Catalina 的 `IOPCIFamily` 是 2.8 一代，同样满足）。Mojave 及更早没验过，真要用就把 `MinKernel` 改成 `18.0.0` / `17.0.0`。
 
 > 必须走 OpenCore 注入（进 kernelcache、开机早期加载）。放进 `/Library/Extensions` 是**开机后**才加载的，对开机卡住没有帮助。
 
