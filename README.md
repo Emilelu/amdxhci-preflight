@@ -223,7 +223,9 @@ cd ../gux && ./build_gux.sh <源码树> <输出目录>   # 不用 xcodebuild 编
 </dict></array></dict>
 ```
 
-拷到 `EFI/OC/Kexts/AMDXHCIPreflight.kext`。`MinKernel` / `MaxKernel` 留空。
+拷到 `EFI/OC/Kexts/AMDXHCIPreflight.kext`，`MinKernel` 填 `20.0.0`（Big Sur 起），`MaxKernel` 留空。
+
+> **兼容范围：Big Sur 11 → Tahoe 26，同一个 x86_64 二进制。** 代码只用 `IOService` / `IOPCIDevice` / `IOMemoryMap` / `IOLog` / `IOSleep` 和自己定义的一套 xHCI 寄存器常量，不继承任何 USB 类，因此不随 USB 栈改版错位。版本门槛全在 plist 里：`com.apple.kpi.*` 声明 `12.0.0`（10.9 起就没变过），`com.apple.iokit.IOPCIFamily` 声明 **`2.6`** 而不是编译机上的 `2.9` —— 加载器要求「库的 compatible 版 ≤ 声明值 ≤ 库的 CFBundleVersion」，取低界才能一个二进制通吃。Catalina 10.15 及更早不支持（`IOPCIFamily` 还是 2.8 一代，且那些系统本来没有这个开机卡住的问题）。
 
 > 必须走 OpenCore 注入（进 kernelcache、开机早期加载）。放进 `/Library/Extensions` 是**开机后**才加载的，对开机卡住没有帮助。
 

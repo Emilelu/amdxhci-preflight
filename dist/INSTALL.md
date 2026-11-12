@@ -28,12 +28,23 @@ EFI/OC/Kexts/AMDXHCIPreflight.kext
     <key>Enabled</key>           <true/>
     <key>ExecutablePath</key>    <string>Contents/MacOS/AMDXHCIPreflight</string>
     <key>MaxKernel</key>         <string></string>
-    <key>MinKernel</key>         <string>23.0.0</string>
+    <key>MinKernel</key>         <string>20.0.0</string>
     <key>PlistPath</key>         <string>Contents/Info.plist</string>
 </dict>
 ```
 
-`MinKernel 23.0.0` = Sonoma 起（23.x）；想更早的版本也生效就留空。
+`MinKernel 20.0.0` = **Big Sur 11 起**（20.x）。这个 kext 只依赖 `com.apple.kpi.*` 和 `com.apple.iokit.IOPCIFamily`，plist 里声明的是 `IOPCIFamily 2.6`（不是编译机上的 2.9），所以同一个二进制从 Big Sur 一直能加载到 Tahoe：
+
+| 系统 | `MinKernel` |
+|---|---|
+| Big Sur 11 | `20.0.0` |
+| Monterey 12 | `21.0.0` |
+| Ventura 13 | `22.0.0` |
+| Sonoma 14 | `23.0.0` |
+| Sequoia 15 | `24.0.0` |
+| Tahoe 26 | `25.0.0` |
+
+Catalina 10.15 及更早不在支持范围（`IOPCIFamily` 是 2.8 一代，且这些系统上本来没有这个开机卡住的问题）。`MaxKernel` 留空表示不设上限。
 
 ## 3. 别同时装旧的 fork
 

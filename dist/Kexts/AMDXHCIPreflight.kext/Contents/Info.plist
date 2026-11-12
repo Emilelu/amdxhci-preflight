@@ -45,8 +45,16 @@
 	<string>AMD xHCI preflight, no warranty</string>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<!--
+		     2.6, not the 2.9 the build machine happens to run. The loader
+		     requires compatibleVersion <= declared <= installedVersion, and
+		     every API used here (configRead16 / configWrite16,
+		     mapDeviceMemoryWithIndex, findPCICapability) predates 10.9.
+		     Declaring the lower bound is what makes one binary load on
+		     Big Sur (11) through Tahoe (26) instead of only on the newest.
+		-->
 		<key>com.apple.iokit.IOPCIFamily</key>
-		<string>2.9</string>
+		<string>2.6</string>
 		<key>com.apple.kpi.iokit</key>
 		<string>12.0.0</string>
 		<key>com.apple.kpi.libkern</key>
